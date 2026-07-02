@@ -144,6 +144,15 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
         if os.environ.get("VERATHOS_NO_VALIDATOR_AUTH") == "1":
             return await call_next(request)
 
+        # Trusted proxy forwarding from a VPS miner (inference GPU fleet).
+        try:
+            from verallm.api.proxy_auth import proxy_llm_key_from_env, verify_proxy_llm_request
+
+            if proxy_llm_key_from_env() and verify_proxy_llm_request(request):
+                return await call_next(request)
+        except Exception:
+            pass
+
         # Reload validators periodically
         self._load_validators()
 

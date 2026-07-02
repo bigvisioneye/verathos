@@ -46,7 +46,9 @@ from neurons.capacity_audit import (
     transcript_root,
 )
 from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT
+from neurons.capacity_audit_balancer import CapacityAuditBalancerClient
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
+from neurons.capacity_audit_remote import RemoteAuditClient
 from neurons.discovery import ActiveMiner
 from neurons.subnet_runtime_config import (
     RuntimeSubnetConfigClient,
@@ -128,6 +130,8 @@ class CapacityAuditMinerWorker:
         local_health_url: str = "",
         audit_state_file: str = "",
         poll_interval_s: float = 2.0,
+        audit_balancer_url: str = "",
+        audit_balancer_api_key: str = "",
     ):
         self.config = config
         self.miner_client = miner_client
@@ -147,6 +151,16 @@ class CapacityAuditMinerWorker:
             manual_urls=self.validator_urls,
         )
         self.poll_interval_s = max(0.1, float(poll_interval_s))
+        self.audit_balancer_url = str(audit_balancer_url or "").strip()
+        self.audit_balancer_api_key = str(audit_balancer_api_key or "").strip()
+        self._audit_balancer = (
+            CapacityAuditBalancerClient(
+                self.audit_balancer_url,
+                api_key=self.audit_balancer_api_key,
+            )
+            if self.audit_balancer_url
+            else None
+        )
         self.runtime_cfg = capacity_audit_config_from_neuron_config(config)
         self._subnet_runtime_config_client = RuntimeSubnetConfigClient.from_config(
             config,
@@ -170,6 +184,9 @@ class CapacityAuditMinerWorker:
         self._workspace_ext_ready = False
         self._resolved_epoch_blocks: Optional[int] = None
         self._audit_endpoint_rejections: dict[str, set[str]] = {}
+
+    def _use_remote_audit(self) -> bool:
+        return self._audit_balancer is not None
 
     def _refresh_subnet_runtime_config(
         self,
@@ -837,12 +854,17 @@ class CapacityAuditMinerWorker:
         last_wait_error = ""
         last_wait_error_logged_at = 0.0
         try:
-            prepared = self._prepare_audit_process(audit_slot, start_timeout_s=max(60.0, lead_wait_s + 60.0))
-            if prepared is None:
-                self._extend_busy_selection_until_current_head(audit_slot)
-                self._clear_audit_drain(audit_slot.audit_id)
-                return
-            self._store_prepared_audit(audit_slot.audit_id, prepared)
+            prepared: Optional[PreparedAuditProcess] = None
+            if not self._use_remote_audit():
+                prepared = self._prepare_audit_process(
+                    audit_slot,
+                    start_timeout_s=max(60.0, lead_wait_s + 60.0),
+                )
+                if prepared is None:
+                    self._extend_busy_selection_until_current_head(audit_slot)
+                    self._clear_audit_drain(audit_slot.audit_id)
+                    return
+                self._store_prepared_audit(audit_slot.audit_id, prepared)
             while self._running and time.time() < deadline:
                 if self._audit_already_started(audit_slot.audit_id):
                     if self._drop_prepared_audit(audit_slot.audit_id, prepared):
@@ -1076,10 +1098,12 @@ class CapacityAuditMinerWorker:
         urls: list[str] = []
         if miner.address.lower() != self.evm_address or int(miner.model_index) != self.model_index:
             return urls
-        if self.local_health_url:
-            urls.append(self.local_health_url)
         if miner.endpoint:
             urls.append(miner.endpoint.rstrip("/"))
+        if self.local_health_url and not self._use_remote_audit():
+            urls.append(self.local_health_url)
+        elif self.local_health_url and self.local_health_url not in urls:
+            urls.append(self.local_health_url)
         out: list[str] = []
         seen: set[str] = set()
         for url in urls:
@@ -1439,6 +1463,185 @@ class CapacityAuditMinerWorker:
         except Exception:
             pass
 
+    def _run_audit_slot_remote(
+        self,
+        audit_slot: MinerAuditSlot,
+        audit_block_hash: bytes,
+        subtensor=None,
+    ) -> None:
+        if not self._mark_audit_started_once(audit_slot.audit_id):
+            return
+        self._mark_audit_drain(audit_slot, phase="running")
+        lease = self._audit_lease(audit_slot, subtensor)
+        proof_seed = derive_proof_seed(audit_block_hash, slot_id(audit_slot.slot), 0)
+        started_at = time.time()
+        worker_lease = None
+        remote: Optional[RemoteAuditClient] = None
+        job_id = ""
+        pass0_sent = False
+        final_sent = False
+        pass0_root = ""
+        final_root = ""
+        transcript = ""
+        final_timing_data: dict = {}
+
+        def _pick_worker_with_retry() -> None:
+            nonlocal worker_lease, remote
+            last_exc: Optional[Exception] = None
+            while time.time() - started_at < 8.0:
+                try:
+                    worker_lease = self._audit_balancer.pick_worker(audit_slot.gpu_class_name)
+                    if worker_lease is None:
+                        raise RuntimeError("audit balancer returned no worker")
+                    remote = RemoteAuditClient(worker_lease.endpoint, worker_lease.worker_key)
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.25)
+            raise RuntimeError(f"audit worker pick failed: {last_exc}")
+
+        try:
+            _pick_worker_with_retry()
+            assert remote is not None
+            job_id = remote.start_job(
+                {
+                    "lease_id": lease,
+                    "audit_id": audit_slot.audit_id,
+                    "proof_seed_hex": proof_seed,
+                    "challenge_timeout_s": self._audit_challenge_timeout_s(audit_slot),
+                    "workload_spec": dict(audit_slot.workload_spec or {}),
+                    "pass_count": audit_slot.passes,
+                    "gpu_class": audit_slot.gpu_class_name,
+                }
+            )
+            bt.logging.info(
+                f"Capacity audit remote job started: audit_id={audit_slot.audit_id[:12]} "
+                f"job_id={job_id[:12]} worker={worker_lease.worker_id if worker_lease else ''}"
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Capacity audit remote start failed: audit_id={audit_slot.audit_id[:12]} err={exc}"
+            )
+            if worker_lease is not None:
+                try:
+                    self._audit_balancer.release(worker_lease.lease_id)
+                except Exception:
+                    pass
+            self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
+            self._clear_audit_drain(audit_slot.audit_id)
+            return
+
+        challenge_wait_s = (
+            max(0, audit_slot.proof_challenge_block - audit_slot.audit_block) * 12.0
+            + float(self.runtime_cfg.payload_deadline_s or 0.0)
+        )
+        deadline = time.time() + max(120.0, audit_slot.deadline_s + 90.0 + challenge_wait_s)
+
+        try:
+            while time.time() < deadline and remote is not None:
+                status = remote.get_job(job_id)
+                if status.phase == "failed":
+                    raise RuntimeError(status.error or "remote audit failed")
+                if not pass0_sent and status.pass0_root:
+                    pass0_root = _root_hex(status.pass0_root)
+                    self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+                    pass0_sent = True
+                if not final_sent and status.final_timing:
+                    final_timing_data = dict(status.final_timing)
+                    if not pass0_sent:
+                        raw_pass0_root = final_timing_data.get("pass0_root")
+                        if raw_pass0_root:
+                            pass0_root = _root_hex(raw_pass0_root)
+                            self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+                            pass0_sent = True
+                    final_root = _root_hex(final_timing_data.get("root") or [])
+                    transcript = str(final_timing_data.get("transcript_root") or "")
+                    if not transcript:
+                        transcript = transcript_root([pass0_root, final_root])
+                    self._publish_receipt(
+                        self._final_artifact(
+                            audit_slot,
+                            pass0_root,
+                            final_root,
+                            transcript,
+                            final_timing=final_timing_data,
+                        )
+                    )
+                    final_sent = True
+                    if subtensor is None:
+                        try:
+                            subtensor = self._subtensor()
+                        except Exception:
+                            subtensor = None
+                    if subtensor is not None:
+                        challenge_seed = self._wait_for_proof_challenge_seed(
+                            audit_slot,
+                            transcript=transcript,
+                            lease=lease,
+                            subtensor=subtensor,
+                            timeout_s=challenge_wait_s,
+                        )
+                        if challenge_seed:
+                            remote.submit_proof_challenge(job_id, challenge_seed)
+                        else:
+                            bt.logging.warning(
+                                f"Capacity audit proof challenge unavailable: "
+                                f"audit_id={audit_slot.audit_id[:12]} B_proof={audit_slot.proof_challenge_block}"
+                            )
+                    break
+                time.sleep(0.05)
+
+            if final_sent and remote is not None:
+                proof_timeout = max(5.0, float(self.runtime_cfg.payload_deadline_s or 0.0) + 30.0)
+                try:
+                    status = remote.wait_for_phase(job_id, "proof_ready", timeout_s=proof_timeout)
+                except TimeoutError:
+                    status = remote.get_job(job_id)
+                final_summary = dict(status.final_summary or {})
+                if not final_summary:
+                    bt.logging.warning(
+                        f"Capacity audit remote missing final proof summary: "
+                        f"audit_id={audit_slot.audit_id[:12]} phase={status.phase}"
+                    )
+                else:
+                    proof_payload = self._proof_payload_artifact(
+                        audit_slot,
+                        pass0_root=pass0_root,
+                        final_root=final_root,
+                        transcript=transcript,
+                        lease=lease,
+                        final_summary=final_summary,
+                    )
+                    if proof_payload is None:
+                        bt.logging.warning(
+                            f"Capacity audit proof payload missing verifier proof: "
+                            f"audit_id={audit_slot.audit_id[:12]}"
+                        )
+                    else:
+                        self._publish_proof(proof_payload)
+                        bt.logging.info(
+                            f"Capacity audit artifacts published (remote): audit_id={audit_slot.audit_id[:12]}"
+                        )
+            elif not final_sent:
+                bt.logging.warning(
+                    f"Capacity audit remote workload did not produce final receipt: "
+                    f"audit_id={audit_slot.audit_id[:12]}"
+                )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Capacity audit remote run failed: audit_id={audit_slot.audit_id[:12]} err={exc}"
+            )
+        finally:
+            if remote is not None and job_id:
+                remote.cancel_job(job_id)
+            if worker_lease is not None:
+                try:
+                    self._audit_balancer.release(worker_lease.lease_id)
+                except Exception:
+                    pass
+            self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
+            self._clear_audit_drain(audit_slot.audit_id)
+
     def _run_audit_slot(
         self,
         audit_slot: MinerAuditSlot,
@@ -1447,6 +1650,9 @@ class CapacityAuditMinerWorker:
         *,
         prepared: Optional[PreparedAuditProcess] = None,
     ) -> None:
+        if self._use_remote_audit():
+            self._run_audit_slot_remote(audit_slot, audit_block_hash, subtensor=subtensor)
+            return
         if prepared is None:
             prepared = self._pop_prepared_audit(audit_slot.audit_id)
         else:

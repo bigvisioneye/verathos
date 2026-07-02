@@ -55,6 +55,17 @@ from verallm.chain.wallet import derive_evm_private_key, derive_evm_address
 logger = logging.getLogger(__name__)
 
 
+def _health_vram_gb(health_url: str) -> int:
+    try:
+        resp = httpx.get(f"{health_url.rstrip('/')}/health", timeout=5.0)
+        if resp.status_code != 200:
+            return 0
+        hw = (resp.json() or {}).get("hardware") or {}
+        return int(hw.get("vram_gb") or 0)
+    except Exception:
+        return 0
+
+
 def _capacity_audit_worker_poll_interval(config) -> float:
     raw_value = getattr(config, "capacity_audit_worker_poll_s", 2.0)
     try:
@@ -1247,6 +1258,26 @@ def parse_args():
     parser.add_argument("--capacity-audit-worker-poll-s", type=float, default=None,
                         help="Miner-side capacity-audit chain polling interval in seconds.")
 
+    proxy_group = parser.add_argument_group("proxy (no-GPU VPS)")
+    proxy_group.add_argument("--proxy-mode", action="store_true",
+                             help="Run validator-facing proxy without local vLLM (implies --skip-gpu-check on server).")
+    proxy_group.add_argument("--proxy-balancer", default=None,
+                             help="Inference balancer base URL (Balancer 1) for /chat forwarding.")
+    proxy_group.add_argument("--proxy-balancer-key", default=None,
+                             help="Bearer token for Balancer 1 (or PROXY_BALANCER_API_KEY).")
+    proxy_group.add_argument("--proxy-llm-key", default=None,
+                             help="Shared secret sent to inference GPUs (or PROXY_LLM_KEY).")
+    proxy_group.add_argument("--capacity-audit-balancer", default=None,
+                             help="Audit worker balancer base URL (Balancer 2) for remote capacity audits.")
+    proxy_group.add_argument("--capacity-audit-balancer-key", default=None,
+                             help="Bearer token for Balancer 2 (or CAPACITY_AUDIT_BALANCER_API_KEY).")
+    proxy_group.add_argument("--advertised-gpu-name", default=None,
+                             help="GPU name exposed via proxy /health (or VERATHOS_ADVERTISED_GPU_NAME).")
+    proxy_group.add_argument("--advertised-vram-gb", type=int, default=None,
+                             help="VRAM GB exposed via proxy /health (or VERATHOS_ADVERTISED_VRAM_GB).")
+    proxy_group.add_argument("--advertised-gpu-uuids", default=None,
+                             help="Comma-separated GPU UUIDs for /health (or VERATHOS_ADVERTISED_GPU_UUIDS).")
+
     # TEE (Trusted Execution Environment)
     tee_group = parser.add_argument_group("tee")
     parser.add_argument("--allow-validators", nargs="+", default=None,
@@ -1523,6 +1554,19 @@ def main():
     if getattr(args, "capacity_audit_worker_poll_s", None) is not None:
         config.capacity_audit_worker_poll_s = args.capacity_audit_worker_poll_s
 
+    proxy_balancer = str(getattr(args, "proxy_balancer", "") or "").strip()
+    if getattr(args, "proxy_mode", False) or proxy_balancer:
+        config.proxy_mode = True
+        config.proxy_balancer = proxy_balancer
+    if getattr(args, "proxy_balancer_key", None):
+        config.proxy_balancer_key = args.proxy_balancer_key
+    if getattr(args, "proxy_llm_key", None):
+        config.proxy_llm_key = args.proxy_llm_key
+    if getattr(args, "capacity_audit_balancer", None):
+        config.capacity_audit_balancer = args.capacity_audit_balancer
+    if getattr(args, "capacity_audit_balancer_key", None):
+        config.capacity_audit_balancer_key = args.capacity_audit_balancer_key
+
     # ── Early on-chain model check ───────────────────────────────
     # Verify the resolved model is registered on-chain BEFORE loading
     # it into GPU. This avoids wasting ~60s on model load + root
@@ -1633,6 +1677,46 @@ def main():
         except Exception as exc:
             bt.logging.warning(f"Could not clear stale capacity audit state: {exc}")
 
+    if getattr(config, "proxy_mode", False):
+        if "--skip-gpu-check" not in server_args:
+            server_args.append("--skip-gpu-check")
+        if "--proxy-mode" not in server_args:
+            server_args.append("--proxy-mode")
+        if getattr(config, "proxy_balancer", "") and "--proxy-balancer" not in server_args:
+            server_args.extend(["--proxy-balancer", str(config.proxy_balancer)])
+        proxy_balancer_key = str(
+            getattr(args, "proxy_balancer_key", "")
+            or os.environ.get("PROXY_BALANCER_API_KEY", "")
+            or ""
+        ).strip()
+        if proxy_balancer_key and "--proxy-balancer-key" not in server_args:
+            server_args.extend(["--proxy-balancer-key", proxy_balancer_key])
+        proxy_llm_key = str(
+            getattr(args, "proxy_llm_key", "")
+            or os.environ.get("PROXY_LLM_KEY", "")
+            or ""
+        ).strip()
+        if proxy_llm_key and "--proxy-llm-key" not in server_args:
+            server_args.extend(["--proxy-llm-key", proxy_llm_key])
+        if getattr(args, "advertised_gpu_name", None) and "--advertised-gpu-name" not in server_args:
+            server_args.extend(["--advertised-gpu-name", args.advertised_gpu_name])
+        if getattr(args, "advertised_vram_gb", None) is not None and "--advertised-vram-gb" not in server_args:
+            server_args.extend(["--advertised-vram-gb", str(args.advertised_vram_gb)])
+        if getattr(args, "advertised_gpu_uuids", None) and "--advertised-gpu-uuids" not in server_args:
+            server_args.extend(["--advertised-gpu-uuids", args.advertised_gpu_uuids])
+        if "--model-id" not in server_args:
+            cleaned: list[str] = []
+            skip_next = False
+            for arg in server_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == "--model":
+                    skip_next = True
+                    continue
+                cleaned.append(arg)
+            server_args = ["--model-id", resolved.model_id] + cleaned
+
     # Write validator allowlist before starting server to avoid open-access window.
     # Only in wallet mode — Anvil mode has no metagraph.
     if args.wallet:
@@ -1685,14 +1769,21 @@ def main():
             )
             sys.exit(1)
         try:
-            from verallm.registry.gpu import detect_gpu_info
+            if getattr(config, "proxy_mode", False):
+                vram_gb = _health_vram_gb(local_health_url)
+                if vram_gb <= 0:
+                    env_vram = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+                    vram_gb = int(env_vram) if str(env_vram).strip().isdigit() else 0
+            else:
+                from verallm.registry.gpu import detect_gpu_info
 
-            gpu_info = detect_gpu_info()
+                gpu_info = detect_gpu_info()
+                vram_gb = capacity_gate_vram_gb(gpu_info)
             ok, reason, expected = validate_capacity_recommended_model(
                 model_id=resolved.model_id,
                 quant=resolved.quant,
                 max_context_len=int(reg_context or 0),
-                vram_gb=capacity_gate_vram_gb(gpu_info),
+                vram_gb=vram_gb,
                 on_chain_models=on_chain_models,
             )
             if not ok:
@@ -1766,6 +1857,8 @@ def main():
                 local_health_url=local_health_url,
                 audit_state_file=capacity_audit_state_file,
                 poll_interval_s=_capacity_audit_worker_poll_interval(config),
+                audit_balancer_url=str(getattr(config, "capacity_audit_balancer", "") or ""),
+                audit_balancer_api_key=str(getattr(config, "capacity_audit_balancer_key", "") or ""),
             )
             neuron._capacity_audit_worker.start()
         except Exception as e:
