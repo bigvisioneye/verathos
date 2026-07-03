@@ -107,16 +107,51 @@ async def health():
     }
 
 
+def _client_addr(request: Request) -> str:
+    if request.client is not None:
+        return str(request.client.host or "")
+    return ""
+
+
 @app.post("/capacity-audit/v1/jobs")
 async def start_job(body: StartJobBody, request: Request):
     _require_worker_key(request)
     if runner.active_job_count() >= 1:
+        logger.warning(
+            "audit job rejected (busy): audit_id=%s lease=%s client=%s active_jobs=%d",
+            str(body.audit_id or "")[:12],
+            str(body.lease_id or "")[:12],
+            _client_addr(request),
+            runner.active_job_count(),
+        )
         raise HTTPException(status_code=503, detail="audit worker busy")
     payload = body.model_dump()
+    logger.info(
+        "audit job request: audit_id=%s lease=%s client=%s passes=%s gpu_class=%s",
+        str(body.audit_id or "")[:12],
+        str(body.lease_id or "")[:12],
+        _client_addr(request),
+        int(body.pass_count or 0),
+        str(body.gpu_class or _gpu_class or ""),
+    )
     try:
         job_id = runner.start_job(payload)
     except Exception as exc:
+        logger.warning(
+            "audit job start error: audit_id=%s lease=%s client=%s err=%s",
+            str(body.audit_id or "")[:12],
+            str(body.lease_id or "")[:12],
+            _client_addr(request),
+            exc,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    logger.info(
+        "audit job accepted: job_id=%s audit_id=%s lease=%s client=%s",
+        job_id[:12],
+        str(body.audit_id or "")[:12],
+        str(body.lease_id or "")[:12],
+        _client_addr(request),
+    )
     return {"job_id": job_id, "phase": "starting"}
 
 
@@ -146,6 +181,11 @@ async def proof_challenge(job_id: str, body: ProofChallengeBody, request: Reques
     try:
         runner.submit_proof_challenge(job_id, body.challenge_seed)
     except KeyError as exc:
+        logger.warning(
+            "audit proof challenge missing job: job_id=%s client=%s",
+            job_id[:12],
+            _client_addr(request),
+        )
         raise HTTPException(status_code=404, detail="job not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -155,6 +195,11 @@ async def proof_challenge(job_id: str, body: ProofChallengeBody, request: Reques
 @app.delete("/capacity-audit/v1/jobs/{job_id}")
 async def cancel_job(job_id: str, request: Request):
     _require_worker_key(request)
+    logger.info(
+        "audit job cancel request: job_id=%s client=%s",
+        job_id[:12],
+        _client_addr(request),
+    )
     runner.cancel_job(job_id)
     return {"ok": True}
 
@@ -177,8 +222,13 @@ def _heartbeat_loop() -> None:
         }
         try:
             _balancer.heartbeat_worker(payload)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "audit worker heartbeat failed: worker_id=%s active_jobs=%s err=%s",
+                _worker_id,
+                runner.active_job_count(),
+                exc,
+            )
 
 
 def _register_with_balancer() -> None:
@@ -251,6 +301,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     worker_key = str(args.worker_key or os.environ.get("VERATHOS_AUDIT_WORKER_KEY", "") or "").strip()
     if not worker_key:
         raise SystemExit("audit worker requires --worker-key or VERATHOS_AUDIT_WORKER_KEY")
@@ -268,9 +322,13 @@ def main() -> None:
         worker_key=worker_key,
         gpu_class=str(args.gpu_class or ""),
     )
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    logger.info(
+        "audit worker ready: worker_id=%s endpoint=%s gpu_class=%s host=%s port=%s",
+        worker_id,
+        public_endpoint,
+        str(args.gpu_class or _gpu_class or ""),
+        args.host,
+        args.port,
     )
     uvicorn.run(app, host=args.host, port=args.port, access_log=False, log_level="info")
 

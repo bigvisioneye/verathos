@@ -28,9 +28,101 @@ class ProxyInferenceState:
         self.max_context_len: int = 0
         self.slot_id: str = ""
         self.verify_upstream_ssl: bool = True
+        self.mirror_health_url: str = ""
+        self.advertised_gpu_uuids: list[str] = []
 
 
 proxy_state = ProxyInferenceState()
+
+
+def _mirror_health_fields() -> tuple[str, ...]:
+    return (
+        "moe",
+        "batch_mode",
+        "capture_backend",
+        "max_model_len",
+        "max_context",
+        "active_requests",
+        "max_requests",
+        "kv_pool_tokens",
+        "kv_used_tokens",
+        "kv_free_tokens",
+        "kv_utilization_pct",
+        "can_accept_max_context",
+        "proof_pending",
+        "proof_max_pending",
+    )
+
+
+def _fetch_upstream_health(url: str) -> Optional[dict]:
+    try:
+        resp = httpx.get(
+            f"{url.rstrip('/')}/health",
+            timeout=1.0,
+            verify=proxy_state.verify_upstream_ssl,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.debug("proxy health mirror failed for %s: %s", url, exc)
+    return None
+
+
+def _parse_advertised_gpu_uuids(args=None) -> list[str]:
+    raw = ""
+    if args is not None:
+        raw = str(getattr(args, "advertised_gpu_uuids", None) or "").strip()
+    if not raw:
+        raw = str(os.environ.get("VERATHOS_ADVERTISED_GPU_UUIDS", "") or "").strip()
+    if not raw:
+        return []
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def _configured_proxy_gpu_uuids(result: Optional[dict] = None) -> list[str]:
+    if isinstance(result, dict):
+        hw = result.get("hardware")
+        if isinstance(hw, dict):
+            existing = hw.get("gpu_uuids")
+            if isinstance(existing, list) and existing:
+                return list(existing)
+    if proxy_state.advertised_gpu_uuids:
+        return list(proxy_state.advertised_gpu_uuids)
+    return _parse_advertised_gpu_uuids()
+
+
+def merge_upstream_health(result: dict) -> dict:
+    """Proxy /health reflects the inference GPU reached via Balancer 1 /pick."""
+    upstream: Optional[dict] = None
+
+    # Optional pin for debugging; normal proxy miners use balancer /pick only.
+    explicit = str(proxy_state.mirror_health_url or "").strip()
+    if explicit:
+        upstream = _fetch_upstream_health(explicit)
+
+    if upstream is None and proxy_state.balancer_base:
+        try:
+            pick = _pick_upstream(log_pick=False)
+            endpoint = str(pick.get("endpoint") or "").rstrip("/")
+            if endpoint:
+                upstream = _fetch_upstream_health(endpoint)
+        except Exception as exc:
+            logger.debug("proxy health mirror via balancer pick failed: %s", exc)
+
+    if not upstream:
+        return result
+
+    for key in ("model", *_mirror_health_fields()):
+        if key in upstream:
+            result[key] = upstream[key]
+    if isinstance(upstream.get("hardware"), dict) and upstream["hardware"]:
+        hw = dict(upstream["hardware"])
+        proxy_uuids = _configured_proxy_gpu_uuids(result)
+        if proxy_uuids:
+            hw["gpu_uuids"] = proxy_uuids
+        result["hardware"] = hw
+    return result
 
 
 def configure_proxy_from_args(args) -> None:
@@ -64,6 +156,10 @@ def configure_proxy_from_args(args) -> None:
     proxy_state.verify_upstream_ssl = str(
         os.environ.get("PROXY_UPSTREAM_VERIFY_SSL", "1")
     ).strip().lower() not in {"0", "false", "no"}
+    proxy_state.mirror_health_url = str(
+        os.environ.get("PROXY_MIRROR_HEALTH_URL", "") or ""
+    ).strip()
+    proxy_state.advertised_gpu_uuids = _parse_advertised_gpu_uuids(args)
 
 
 def apply_advertised_hardware(state, args) -> None:
@@ -82,8 +178,7 @@ def apply_advertised_hardware(state, args) -> None:
         or os.environ.get("VERATHOS_ADVERTISED_COMPUTE_CAPABILITY", "")
         or ""
     )
-    uuids_raw = str(getattr(args, "advertised_gpu_uuids", "") or os.environ.get("VERATHOS_ADVERTISED_GPU_UUIDS", "") or "")
-    uuids = [u.strip() for u in uuids_raw.split(",") if u.strip()]
+    uuids = _parse_advertised_gpu_uuids(args)
     if gpu_name:
         state.gpu_name = gpu_name
     if vram_gb:
@@ -94,6 +189,7 @@ def apply_advertised_hardware(state, args) -> None:
         state.compute_capability = compute_capability
     if uuids:
         state.gpu_uuids = uuids
+        proxy_state.advertised_gpu_uuids = uuids
 
 
 def _balancer_headers() -> dict[str, str]:
@@ -114,7 +210,7 @@ def _validator_hotkey(request: Optional[Request]) -> str:
     return str(request.headers.get("X-Validator-Hotkey", "") or "").strip()
 
 
-def _pick_upstream() -> dict[str, Any]:
+def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
     if not proxy_state.balancer_base:
         raise RuntimeError("proxy balancer URL not configured")
     params = {
@@ -132,11 +228,12 @@ def _pick_upstream() -> dict[str, Any]:
     endpoint = str(data.get("endpoint") or "").rstrip("/")
     if not endpoint:
         raise RuntimeError(f"balancer /pick missing endpoint: {data}")
-    logger.info(
-        "proxy balancer pick ok: upstream=%s worker_id=%s",
-        endpoint,
-        str(data.get("worker_id") or data.get("slot_id") or ""),
-    )
+    if log_pick:
+        logger.info(
+            "proxy balancer pick ok: upstream=%s worker_id=%s",
+            endpoint,
+            str(data.get("worker_id") or data.get("slot_id") or ""),
+        )
     return data
 
 
@@ -209,6 +306,13 @@ async def proxy_json_post(
             try:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
+            except httpx.StreamClosed:
+                logger.debug(
+                    "proxy upstream SSE closed: path=%s upstream=%s%s",
+                    path,
+                    endpoint,
+                    hotkey_suffix,
+                )
             finally:
                 await resp.aclose()
                 await client.aclose()

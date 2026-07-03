@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from verallm.api.proxy_auth import audit_worker_key_from_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,13 +52,23 @@ class CapacityAuditBalancerClient:
         resp.raise_for_status()
         data = resp.json() or {}
         endpoint = str(data.get("endpoint") or "").rstrip("/")
-        worker_key = str(data.get("worker_key") or "").strip()
+        key_from_pick = bool(str(data.get("worker_key") or "").strip())
+        worker_key = str(data.get("worker_key") or audit_worker_key_from_env() or "").strip()
         lease_id = str(data.get("lease_id") or "").strip()
         if not endpoint or not worker_key or not lease_id:
             raise RuntimeError(f"audit balancer /pick1 missing fields: {data}")
+        worker_id = str(data.get("worker_id") or "")
+        logger.info(
+            "audit balancer pick ok: worker_id=%s endpoint=%s lease_id=%s gpu_class=%s worker_key=%s",
+            worker_id,
+            endpoint,
+            lease_id[:8] + "..." if len(lease_id) > 8 else lease_id,
+            str(data.get("gpu_class") or gpu_class),
+            "pick" if key_from_pick else "env",
+        )
         return AuditWorkerLease(
             lease_id=lease_id,
-            worker_id=str(data.get("worker_id") or ""),
+            worker_id=worker_id,
             endpoint=endpoint,
             worker_key=worker_key,
             gpu_class=str(data.get("gpu_class") or gpu_class),

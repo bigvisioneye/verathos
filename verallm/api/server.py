@@ -101,7 +101,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from verallm.api.proxy_auth import proxy_llm_key_from_env, verify_proxy_llm_request
-from verallm.api.proxy_forward import proxy_json_post, proxy_state
+from verallm.api.proxy_forward import proxy_json_post, proxy_state, merge_upstream_health
 
 from verallm.config import Config, set_config
 from verallm.challenge.beacon import derive_beacon_from_nonce, derive_challenges, derive_sampling_challenge, derive_embedding_challenge
@@ -576,9 +576,6 @@ async def health():
             else (proxy_state.max_context_len or None)
         ),
     }
-    if proxy_state.enabled:
-        result["proxy_mode"] = True
-        result["proxy_balancer"] = proxy_state.balancer_base
     if state.gpu_name:
         result["hardware"] = {
             "gpu_name": state.gpu_name,
@@ -606,6 +603,8 @@ async def health():
             "platform": state.tee_platform,
             "proof_mode": "attestation" if state.tee_skip_proofs else "verallm",
         }
+    if proxy_state.enabled:
+        result = merge_upstream_health(result)
     return result
 
 

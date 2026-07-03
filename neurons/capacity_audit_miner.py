@@ -251,6 +251,10 @@ class CapacityAuditMinerWorker:
         )
 
     def _mark_audit_drain(self, audit_slot: MinerAuditSlot, *, phase: str) -> None:
+        # Remote audit runs on a separate GPU worker; do not block validator
+        # /chat traffic on this proxy or inference-facing endpoint.
+        if self._use_remote_audit():
+            return
         until_ts = self._audit_state_until(audit_slot)
         self._active_audit_id = audit_slot.audit_id
         self._active_audit_until_ts = max(float(self._active_audit_until_ts or 0.0), until_ts)
@@ -1494,16 +1498,33 @@ class CapacityAuditMinerWorker:
         def _pick_worker_with_retry() -> None:
             nonlocal worker_lease, remote
             last_exc: Optional[Exception] = None
+            attempt = 0
             while time.time() - started_at < 8.0:
+                attempt += 1
                 try:
                     worker_lease = self._audit_balancer.pick_worker(audit_slot.gpu_class_name)
                     if worker_lease is None:
                         raise RuntimeError("audit balancer returned no worker")
                     remote = RemoteAuditClient(worker_lease.endpoint, worker_lease.worker_key)
+                    bt.logging.info(
+                        f"Capacity audit worker picked: audit_id={audit_slot.audit_id[:12]} "
+                        f"worker={worker_lease.worker_id} endpoint={worker_lease.endpoint} "
+                        f"lease={worker_lease.lease_id[:8]}... attempts={attempt}"
+                    )
                     return
                 except Exception as exc:
                     last_exc = exc
+                    if attempt == 1 or attempt % 4 == 0:
+                        bt.logging.debug(
+                            f"Capacity audit pick retry: audit_id={audit_slot.audit_id[:12]} "
+                            f"attempt={attempt} err={exc}"
+                        )
                     time.sleep(0.25)
+            bt.logging.warning(
+                f"Capacity audit pick failed after {attempt} attempts: "
+                f"audit_id={audit_slot.audit_id[:12]} gpu_class={audit_slot.gpu_class_name} "
+                f"err={last_exc}"
+            )
             raise RuntimeError(f"audit worker pick failed: {last_exc}")
 
         try:
@@ -1531,8 +1552,15 @@ class CapacityAuditMinerWorker:
             if worker_lease is not None:
                 try:
                     self._audit_balancer.release(worker_lease.lease_id)
-                except Exception:
-                    pass
+                    bt.logging.info(
+                        f"Capacity audit worker released: audit_id={audit_slot.audit_id[:12]} "
+                        f"lease={worker_lease.lease_id[:8]}..."
+                    )
+                except Exception as release_exc:
+                    bt.logging.warning(
+                        f"Capacity audit worker release failed: audit_id={audit_slot.audit_id[:12]} "
+                        f"lease={worker_lease.lease_id[:8]}... err={release_exc}"
+                    )
             self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
             self._clear_audit_drain(audit_slot.audit_id)
             return
@@ -1643,8 +1671,15 @@ class CapacityAuditMinerWorker:
             if worker_lease is not None:
                 try:
                     self._audit_balancer.release(worker_lease.lease_id)
-                except Exception:
-                    pass
+                    bt.logging.info(
+                        f"Capacity audit worker released: audit_id={audit_slot.audit_id[:12]} "
+                        f"lease={worker_lease.lease_id[:8]}..."
+                    )
+                except Exception as release_exc:
+                    bt.logging.warning(
+                        f"Capacity audit worker release failed: audit_id={audit_slot.audit_id[:12]} "
+                        f"lease={worker_lease.lease_id[:8]}... err={release_exc}"
+                    )
             self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
             self._clear_audit_drain(audit_slot.audit_id)
 

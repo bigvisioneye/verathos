@@ -198,6 +198,14 @@ def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
     return f"/tmp/verathos_capacity_audit_{address}_{int(port)}.json"
 
 
+def _receipt_db_path(evm_address: str | None, port: int) -> str:
+    address = "".join(
+        c for c in str(evm_address or "unknown").lower()
+        if c.isalnum() or c in ("x",)
+    )[:48] or "unknown"
+    return f"/tmp/verathos_receipts_{address}_{int(port)}.db"
+
+
 def _check_external_port(endpoint: str, local_bind_port: int | None = None) -> None:
     """Verify the miner's endpoint port is reachable from the internet.
 
@@ -1834,6 +1842,11 @@ def main():
         )
     else:
         _check_external_port(args.endpoint, local_bind_port=_extract_server_port(server_args))
+
+    os.environ["VERALLM_RECEIPT_DB"] = _receipt_db_path(
+        neuron.evm_addr,
+        _extract_server_port(server_args),
+    )
 
     neuron.start_server(server_args)
 

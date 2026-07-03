@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _root_hex(raw: object) -> str:
@@ -135,6 +138,13 @@ class AuditJobRunner:
                         record.pass0_root = _root_hex(data.get("root"))
                         if record.pass0_root:
                             record.phase = "pass0_ready"
+                            logger.info(
+                                "audit job pass0 ready: job_id=%s audit_id=%s lease=%s root=%s...",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                                record.pass0_root[:12],
+                            )
                     except Exception:
                         pass
                 if final_path.exists() and not record.final_timing:
@@ -143,6 +153,12 @@ class AuditJobRunner:
                         if isinstance(data, dict):
                             record.final_timing = data
                             record.phase = "final_ready"
+                            logger.info(
+                                "audit job final timing ready: job_id=%s audit_id=%s lease=%s",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                            )
                     except Exception:
                         pass
                 if final_summary_path.exists() and not record.final_summary:
@@ -151,6 +167,12 @@ class AuditJobRunner:
                         if isinstance(data, dict):
                             record.final_summary = data
                             record.phase = "proof_ready"
+                            logger.info(
+                                "audit job proof ready: job_id=%s audit_id=%s lease=%s",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                            )
                     except Exception:
                         pass
             if record.phase == "final_ready" and final_summary_path.exists():
@@ -174,6 +196,14 @@ class AuditJobRunner:
                         pass
                     record.phase = "failed"
                     record.error = f"workload exited rc={rc} stderr_tail={str(stderr)[-500:]}"
+                    logger.warning(
+                        "audit job failed: job_id=%s audit_id=%s lease=%s rc=%s err=%s",
+                        record.job_id[:12],
+                        record.audit_id[:12],
+                        record.lease_id[:12],
+                        rc,
+                        record.error[:200],
+                    )
                 elif final_path.exists():
                     try:
                         record.final_timing = json.loads(final_path.read_text())
@@ -229,6 +259,18 @@ class AuditJobRunner:
         record.monitor_thread.start()
         with self._lock:
             self._jobs[job_id] = record
+        workload_version = ""
+        if isinstance(payload.get("workload_spec"), dict):
+            workload_version = str(payload.get("workload_spec", {}).get("workload_version") or "")
+        logger.info(
+            "audit job started: job_id=%s audit_id=%s lease=%s passes=%s workload=%s out_dir=%s",
+            job_id[:12],
+            record.audit_id[:12],
+            lease_id[:12],
+            int(payload.get("pass_count") or 0),
+            workload_version or "?",
+            out_dir,
+        )
         return job_id
 
     def get_job(self, job_id: str) -> Optional[AuditJobRecord]:
@@ -245,6 +287,13 @@ class AuditJobRunner:
         tmp = record.challenge_file.with_suffix(record.challenge_file.suffix + ".tmp")
         tmp.write_text(seed + "\n")
         os.replace(tmp, record.challenge_file)
+        logger.info(
+            "audit job proof challenge submitted: job_id=%s audit_id=%s lease=%s seed_len=%d",
+            job_id[:12],
+            record.audit_id[:12],
+            record.lease_id[:12],
+            len(seed),
+        )
 
     def cancel_job(self, job_id: str) -> None:
         record = self.get_job(job_id)
@@ -260,6 +309,12 @@ class AuditJobRunner:
                 proc.communicate()
         with record.lock:
             record.phase = "cancelled"
+        logger.info(
+            "audit job cancelled: job_id=%s audit_id=%s lease=%s",
+            job_id[:12],
+            record.audit_id[:12],
+            record.lease_id[:12],
+        )
 
     def active_job_count(self) -> int:
         with self._lock:
