@@ -149,6 +149,12 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
             from verallm.api.proxy_auth import proxy_llm_key_from_env, verify_proxy_llm_request
 
             if proxy_llm_key_from_env() and verify_proxy_llm_request(request):
+                client_ip = request.client.host if request.client else "unknown"
+                logger.info(
+                    "Accepted proxy-forwarded %s from %s",
+                    request.url.path,
+                    client_ip,
+                )
                 return await call_next(request)
         except Exception:
             pass

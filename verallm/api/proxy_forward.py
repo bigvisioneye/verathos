@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlencode
@@ -12,6 +13,8 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from verallm.api.proxy_auth import PROXY_LLM_HEADER
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyInferenceState:
@@ -100,6 +103,17 @@ def _balancer_headers() -> dict[str, str]:
     return headers
 
 
+def _validator_hotkey(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    from_request = str(
+        getattr(getattr(request, "state", None), "validator_hotkey", "") or ""
+    ).strip()
+    if from_request:
+        return from_request
+    return str(request.headers.get("X-Validator-Hotkey", "") or "").strip()
+
+
 def _pick_upstream() -> dict[str, Any]:
     if not proxy_state.balancer_base:
         raise RuntimeError("proxy balancer URL not configured")
@@ -118,6 +132,11 @@ def _pick_upstream() -> dict[str, Any]:
     endpoint = str(data.get("endpoint") or "").rstrip("/")
     if not endpoint:
         raise RuntimeError(f"balancer /pick missing endpoint: {data}")
+    logger.info(
+        "proxy balancer pick ok: upstream=%s worker_id=%s",
+        endpoint,
+        str(data.get("worker_id") or data.get("slot_id") or ""),
+    )
     return data
 
 
@@ -154,6 +173,9 @@ async def proxy_json_post(
     pick = _pick_upstream()
     endpoint = str(pick["endpoint"]).rstrip("/")
     url = f"{endpoint}{path}"
+    validator_hotkey = _validator_hotkey(request)
+    hotkey_suffix = f" validator={validator_hotkey[:12]}..." if validator_hotkey else ""
+    logger.info("proxy forwarding %s -> %s%s", path, url, hotkey_suffix)
     async with httpx.AsyncClient(verify=proxy_state.verify_upstream_ssl, timeout=None) as client:
         async with client.stream(
             "POST",
@@ -161,6 +183,13 @@ async def proxy_json_post(
             headers=_upstream_headers(pick, request),
             json=body,
         ) as resp:
+            logger.info(
+                "proxy upstream response: path=%s status=%s upstream=%s%s",
+                path,
+                resp.status_code,
+                endpoint,
+                hotkey_suffix,
+            )
             if resp.status_code >= 400:
                 raw = await resp.aread()
                 try:
