@@ -34,6 +34,9 @@ module.exports = {
       env: {
         VERATHOS_ADVERTISED_GPU_NAME: "NVIDIA A100-SXM4-80GB",
         VERATHOS_ADVERTISED_VRAM_GB: "80",
+        // Set to 0 if Balancer 1 returns https:// GPU endpoints with self-signed certs.
+        // Prefer registering inference GPUs as http:// in Balancer 1 when possible.
+        PROXY_UPSTREAM_VERIFY_SSL: "0",
       },
       autorestart: true,
       merge_logs: true,
