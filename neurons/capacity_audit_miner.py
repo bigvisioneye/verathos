@@ -333,12 +333,13 @@ class CapacityAuditMinerWorker:
         if not self.evm_private_key:
             disabled("Capacity audit miner worker disabled: missing EVM private key")
             return
-        script_dir = self._workspace_script().parent
-        if not self._ensure_workspace_extension(script_dir):
-            disabled(
-                "Capacity audit miner worker disabled: hot-capacity workspace extension unavailable"
-            )
-            return
+        if not self._use_remote_audit():
+            script_dir = self._workspace_script().parent
+            if not self._ensure_workspace_extension(script_dir):
+                disabled(
+                    "Capacity audit miner worker disabled: hot-capacity workspace extension unavailable"
+                )
+                return
         self._running = True
         self._thread = threading.Thread(target=self._run, name="capacity-audit-miner", daemon=True)
         self._thread.start()
@@ -348,10 +349,15 @@ class CapacityAuditMinerWorker:
                 "Capacity audit miner worker started without discovered validator "
                 "audit endpoint yet; discovery will retry before publishing artifacts"
             )
+        remote_note = (
+            f" remote_balancer={self.audit_balancer_url}"
+            if self._use_remote_audit()
+            else ""
+        )
         bt.logging.info(
             f"Capacity audit miner worker started for model_index={self.model_index} "
             f"validators={len(validator_urls)} mode={self.runtime_cfg.mode} "
-            f"poll_s={self.poll_interval_s:g}"
+            f"poll_s={self.poll_interval_s:g}{remote_note}"
         )
 
     def stop(self) -> None:

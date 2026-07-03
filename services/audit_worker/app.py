@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import logging
 import os
 import threading
 import time
@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from neurons.capacity_audit_balancer import CapacityAuditBalancerClient
 from services.audit_worker.runner import AuditJobRunner
 from verallm.api.proxy_auth import AUDIT_WORKER_HEADER, verify_audit_worker_request
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Verathos Audit Worker", version="0.1.0")
 runner = AuditJobRunner()
@@ -160,17 +162,21 @@ async def cancel_job(job_id: str, request: Request):
 def _heartbeat_loop() -> None:
     if _balancer is None or not _worker_id:
         return
+    logger.info(
+        "audit worker heartbeat loop started: worker_id=%s balancer=%s interval_s=15",
+        _worker_id,
+        _balancer.base_url,
+    )
     while not _heartbeat_stop.wait(15.0):
+        payload = {
+            "worker_id": _worker_id,
+            "endpoint": _worker_endpoint,
+            "worker_key": _worker_key,
+            "gpu_class": _gpu_class,
+            "active_jobs": runner.active_job_count(),
+        }
         try:
-            _balancer.heartbeat_worker(
-                {
-                    "worker_id": _worker_id,
-                    "endpoint": _worker_endpoint,
-                    "worker_key": _worker_key,
-                    "gpu_class": _gpu_class,
-                    "active_jobs": runner.active_job_count(),
-                }
-            )
+            _balancer.heartbeat_worker(payload)
         except Exception:
             pass
 
@@ -179,6 +185,12 @@ def _register_with_balancer() -> None:
     global _balancer
     balancer_url = str(os.environ.get("CAPACITY_AUDIT_BALANCER_URL", "") or "").strip()
     if not balancer_url:
+        logger.info(
+            "audit worker balancer disabled: CAPACITY_AUDIT_BALANCER_URL not set "
+            "(worker_id=%s endpoint=%s)",
+            _worker_id,
+            _worker_endpoint,
+        )
         return
     api_key = str(os.environ.get("CAPACITY_AUDIT_BALANCER_API_KEY", "") or "").strip()
     _balancer = CapacityAuditBalancerClient(balancer_url, api_key=api_key)
@@ -189,7 +201,22 @@ def _register_with_balancer() -> None:
         "gpu_class": _gpu_class,
         "lease_ttl_s": 60,
     }
-    _balancer.register_worker(payload)
+    logger.info(
+        "audit worker registering with balancer: worker_id=%s endpoint=%s gpu_class=%s url=%s",
+        _worker_id,
+        _worker_endpoint,
+        _gpu_class,
+        balancer_url,
+    )
+    try:
+        _balancer.register_worker(payload)
+    except Exception:
+        logger.warning(
+            "audit worker initial balancer register failed; heartbeats will retry "
+            "(worker_id=%s url=%s)",
+            _worker_id,
+            balancer_url,
+        )
 
 
 def configure_worker(
@@ -240,6 +267,10 @@ def main() -> None:
         endpoint=public_endpoint,
         worker_key=worker_key,
         gpu_class=str(args.gpu_class or ""),
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     uvicorn.run(app, host=args.host, port=args.port, access_log=False, log_level="info")
 

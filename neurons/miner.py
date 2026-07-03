@@ -102,6 +102,94 @@ def _set_server_arg(server_args: list[str], flag: str, value: str) -> list[str]:
     return out
 
 
+def _remove_server_arg(server_args: list[str], flag: str) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in server_args:
+        if skip:
+            skip = False
+            continue
+        if arg == flag:
+            skip = True
+            continue
+        out.append(arg)
+    return out
+
+
+_SERVER_BOOL_FLAGS = frozenset({
+    "--no-cache",
+    "--diagnose",
+    "--force",
+    "--batch-mode",
+    "--no-batch-mode",
+    "--awq-gemm-fallback",
+    "--skip-gpu-check",
+    "--tee-enabled",
+    "--tee-skip-proofs",
+    "--proxy-mode",
+})
+
+
+def _sanitize_server_args(server_args: list[str]) -> list[str]:
+    """Drop orphan tokens left by PM2/shell word-splitting (e.g. GPU name fragments)."""
+    out: list[str] = []
+    expect_value = False
+    for arg in server_args:
+        if expect_value:
+            out.append(arg)
+            expect_value = False
+            continue
+        if not arg.startswith("-"):
+            continue
+        out.append(arg)
+        if arg not in _SERVER_BOOL_FLAGS:
+            expect_value = True
+    return out
+
+
+def _proxy_advertised_gpu_name(args) -> str:
+    return str(
+        os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "")
+        or getattr(args, "advertised_gpu_name", "")
+        or ""
+    ).strip()
+
+
+def _proxy_advertised_vram_gb(args) -> int | None:
+    raw = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+    if str(raw).strip().isdigit():
+        return int(raw)
+    vram = getattr(args, "advertised_vram_gb", None)
+    return int(vram) if vram is not None else None
+
+
+def _proxy_advertised_gpu_uuids(args) -> str:
+    return str(
+        getattr(args, "advertised_gpu_uuids", "")
+        or os.environ.get("VERATHOS_ADVERTISED_GPU_UUIDS", "")
+        or ""
+    ).strip()
+
+
+def _apply_proxy_hardware_server_args(server_args: list[str], args) -> list[str]:
+    """Forward advertised /health hardware to the inner server subprocess."""
+    server_args = _sanitize_server_args(server_args)
+    server_args = _remove_server_arg(server_args, "--advertised-gpu-name")
+    server_args = _remove_server_arg(server_args, "--advertised-vram-gb")
+    server_args = _remove_server_arg(server_args, "--advertised-gpu-uuids")
+
+    gpu_name = _proxy_advertised_gpu_name(args)
+    if gpu_name:
+        server_args = _set_server_arg(server_args, "--advertised-gpu-name", gpu_name)
+    vram_gb = _proxy_advertised_vram_gb(args)
+    if vram_gb is not None:
+        server_args = _set_server_arg(server_args, "--advertised-vram-gb", str(vram_gb))
+    uuids = _proxy_advertised_gpu_uuids(args)
+    if uuids:
+        server_args = _set_server_arg(server_args, "--advertised-gpu-uuids", uuids)
+    return server_args
+
+
 def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
     address = "".join(
         c for c in str(evm_address or "unknown").lower()
@@ -1272,7 +1360,8 @@ def parse_args():
     proxy_group.add_argument("--capacity-audit-balancer-key", default=None,
                              help="Bearer token for Balancer 2 (or CAPACITY_AUDIT_BALANCER_API_KEY).")
     proxy_group.add_argument("--advertised-gpu-name", default=None,
-                             help="GPU name exposed via proxy /health (or VERATHOS_ADVERTISED_GPU_NAME).")
+                             help="GPU name exposed via proxy /health (or VERATHOS_ADVERTISED_GPU_NAME). "
+                                  "Use the env var when the name contains spaces (PM2/shell splitting).")
     proxy_group.add_argument("--advertised-vram-gb", type=int, default=None,
                              help="VRAM GB exposed via proxy /health (or VERATHOS_ADVERTISED_VRAM_GB).")
     proxy_group.add_argument("--advertised-gpu-uuids", default=None,
@@ -1484,6 +1573,15 @@ def main():
     if getattr(args, "capacity_audit", False):
         config.capacity_audit_enabled = True
 
+    proxy_mode_early = bool(
+        getattr(args, "proxy_mode", False)
+        or str(getattr(args, "proxy_balancer", "") or "").strip()
+    )
+    advertised_vram_gb = getattr(args, "advertised_vram_gb", None)
+    if advertised_vram_gb is None:
+        env_vram = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+        advertised_vram_gb = int(env_vram) if str(env_vram).strip().isdigit() else None
+
     # Resolve model configuration (auto or explicit)
     resolved = resolve_model_config(
         model_id=args.model_id,
@@ -1493,7 +1591,12 @@ def main():
         category=args.category,
         chain_config=resolved_chain_path,
         subtensor_network=args.subtensor_network,
-        capacity_audit_required=bool(getattr(config, "capacity_audit_enabled", False)),
+        capacity_audit_required=(
+            bool(getattr(config, "capacity_audit_enabled", False))
+            and not proxy_mode_early
+        ),
+        no_local_gpu=proxy_mode_early,
+        advertised_vram_gb=advertised_vram_gb,
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
@@ -1698,12 +1801,7 @@ def main():
         ).strip()
         if proxy_llm_key and "--proxy-llm-key" not in server_args:
             server_args.extend(["--proxy-llm-key", proxy_llm_key])
-        if getattr(args, "advertised_gpu_name", None) and "--advertised-gpu-name" not in server_args:
-            server_args.extend(["--advertised-gpu-name", args.advertised_gpu_name])
-        if getattr(args, "advertised_vram_gb", None) is not None and "--advertised-vram-gb" not in server_args:
-            server_args.extend(["--advertised-vram-gb", str(args.advertised_vram_gb)])
-        if getattr(args, "advertised_gpu_uuids", None) and "--advertised-gpu-uuids" not in server_args:
-            server_args.extend(["--advertised-gpu-uuids", args.advertised_gpu_uuids])
+        server_args = _apply_proxy_hardware_server_args(server_args, args)
         if "--model-id" not in server_args:
             cleaned: list[str] = []
             skip_next = False
@@ -1774,6 +1872,10 @@ def main():
                 if vram_gb <= 0:
                     env_vram = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
                     vram_gb = int(env_vram) if str(env_vram).strip().isdigit() else 0
+                if vram_gb > 0:
+                    from verallm.registry.gpu import normalize_marketed_vram_gb
+
+                    vram_gb = normalize_marketed_vram_gb(vram_gb)
             else:
                 from verallm.registry.gpu import detect_gpu_info
 
@@ -1786,6 +1888,14 @@ def main():
                 vram_gb=vram_gb,
                 on_chain_models=on_chain_models,
             )
+            if not ok and getattr(config, "proxy_mode", False) and on_chain_models:
+                on_chain_set = {str(m).lower() for m in on_chain_models}
+                if str(resolved.model_id).lower() in on_chain_set:
+                    bt.logging.warning(
+                        f"Proxy mode: capacity model gate waived for on-chain model "
+                        f"{resolved.model_id} ({reason})"
+                    )
+                    ok = True
             if not ok:
                 expected_text = ""
                 if expected is not None:

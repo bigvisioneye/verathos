@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlencode
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -75,10 +78,57 @@ class CapacityAuditBalancerClient:
         if not self.base_url:
             return
         url = f"{self.base_url}/v1/workers/register"
-        httpx.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+        worker_id = str(payload.get("worker_id") or "")
+        try:
+            resp = httpx.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+            resp.raise_for_status()
+            logger.info(
+                "audit balancer register ok: worker_id=%s endpoint=%s gpu_class=%s status=%s url=%s",
+                worker_id,
+                payload.get("endpoint"),
+                payload.get("gpu_class"),
+                resp.status_code,
+                self.base_url,
+            )
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.warning(
+                "audit balancer register failed: worker_id=%s endpoint=%s gpu_class=%s "
+                "status=%s url=%s error=%s",
+                worker_id,
+                payload.get("endpoint"),
+                payload.get("gpu_class"),
+                status,
+                url,
+                exc,
+            )
+            raise
 
     def heartbeat_worker(self, payload: dict[str, Any]) -> None:
         if not self.base_url:
             return
         url = f"{self.base_url}/v1/workers/heartbeat"
-        httpx.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+        worker_id = str(payload.get("worker_id") or "")
+        try:
+            resp = httpx.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+            resp.raise_for_status()
+            logger.info(
+                "audit balancer heartbeat ok: worker_id=%s active_jobs=%s gpu_class=%s status=%s",
+                worker_id,
+                payload.get("active_jobs"),
+                payload.get("gpu_class"),
+                resp.status_code,
+            )
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.warning(
+                "audit balancer heartbeat failed: worker_id=%s active_jobs=%s gpu_class=%s "
+                "status=%s url=%s error=%s",
+                worker_id,
+                payload.get("active_jobs"),
+                payload.get("gpu_class"),
+                status,
+                url,
+                exc,
+            )
+            raise
