@@ -176,46 +176,65 @@ async def proxy_json_post(
     validator_hotkey = _validator_hotkey(request)
     hotkey_suffix = f" validator={validator_hotkey[:12]}..." if validator_hotkey else ""
     logger.info("proxy forwarding %s -> %s%s", path, url, hotkey_suffix)
-    async with httpx.AsyncClient(verify=proxy_state.verify_upstream_ssl, timeout=None) as client:
-        async with client.stream(
-            "POST",
-            url,
-            headers=_upstream_headers(pick, request),
-            json=body,
-        ) as resp:
-            logger.info(
-                "proxy upstream response: path=%s status=%s upstream=%s%s",
-                path,
-                resp.status_code,
-                endpoint,
-                hotkey_suffix,
-            )
-            if resp.status_code >= 400:
-                raw = await resp.aread()
-                try:
-                    content = json.loads(raw.decode()) if raw else {"error": resp.reason_phrase}
-                except json.JSONDecodeError:
-                    content = {"error": raw.decode(errors="replace")}
-                return JSONResponse(status_code=resp.status_code, content=content)
-            content_type = resp.headers.get("content-type", "")
-            if "text/event-stream" in content_type:
-                return StreamingResponse(
-                    resp.aiter_bytes(),
-                    status_code=resp.status_code,
-                    media_type=content_type,
-                    headers={
-                        k: v
-                        for k, v in resp.headers.items()
-                        if k.lower() in {"cache-control", "x-accel-buffering"}
-                    },
-                )
+    client = httpx.AsyncClient(verify=proxy_state.verify_upstream_ssl, timeout=None)
+    req = client.build_request(
+        "POST",
+        url,
+        headers=_upstream_headers(pick, request),
+        json=body,
+    )
+    resp = await client.send(req, stream=True)
+    logger.info(
+        "proxy upstream response: path=%s status=%s upstream=%s%s",
+        path,
+        resp.status_code,
+        endpoint,
+        hotkey_suffix,
+    )
+    if resp.status_code >= 400:
+        try:
             raw = await resp.aread()
-            if raw:
-                try:
-                    return json.loads(raw.decode())
-                except json.JSONDecodeError:
-                    return JSONResponse(status_code=resp.status_code, content={"raw": raw.decode(errors="replace")})
-            return JSONResponse(status_code=resp.status_code, content={})
+            try:
+                content = json.loads(raw.decode()) if raw else {"error": resp.reason_phrase}
+            except json.JSONDecodeError:
+                content = {"error": raw.decode(errors="replace")}
+            return JSONResponse(status_code=resp.status_code, content=content)
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        async def sse_iter():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            sse_iter(),
+            status_code=resp.status_code,
+            media_type=content_type,
+            headers={
+                k: v
+                for k, v in resp.headers.items()
+                if k.lower() in {"cache-control", "x-accel-buffering"}
+            },
+        )
+
+    try:
+        raw = await resp.aread()
+        if raw:
+            try:
+                return json.loads(raw.decode())
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=resp.status_code, content={"raw": raw.decode(errors="replace")})
+        return JSONResponse(status_code=resp.status_code, content={})
+    finally:
+        await resp.aclose()
+        await client.aclose()
 
 
 def proxy_startup_minimal(state, args) -> None:
