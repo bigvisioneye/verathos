@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -9,6 +10,15 @@ from typing import Any, Optional
 import httpx
 
 from verallm.api.proxy_auth import AUDIT_WORKER_HEADER
+
+
+def audit_worker_verify_ssl() -> bool:
+    return str(os.environ.get("PROXY_UPSTREAM_VERIFY_SSL", "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 @dataclass
@@ -38,6 +48,7 @@ class RemoteAuditClient:
         self.endpoint = str(endpoint or "").rstrip("/")
         self.worker_key = str(worker_key or "").strip()
         self.timeout_s = max(1.0, float(timeout_s))
+        self.verify_ssl = audit_worker_verify_ssl()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -48,7 +59,13 @@ class RemoteAuditClient:
 
     def start_job(self, payload: dict[str, Any]) -> str:
         url = f"{self.endpoint}/capacity-audit/v1/jobs"
-        resp = httpx.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+        resp = httpx.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=self.timeout_s,
+            verify=self.verify_ssl,
+        )
         resp.raise_for_status()
         data = resp.json() or {}
         job_id = str(data.get("job_id") or "").strip()
@@ -58,7 +75,7 @@ class RemoteAuditClient:
 
     def get_job(self, job_id: str) -> RemoteAuditJobStatus:
         url = f"{self.endpoint}/capacity-audit/v1/jobs/{job_id}"
-        resp = httpx.get(url, headers=self._headers(), timeout=self.timeout_s)
+        resp = httpx.get(url, headers=self._headers(), timeout=self.timeout_s, verify=self.verify_ssl)
         resp.raise_for_status()
         data = resp.json() or {}
         pass0 = data.get("pass0") if isinstance(data.get("pass0"), dict) else {}
@@ -78,13 +95,14 @@ class RemoteAuditClient:
             headers=self._headers(),
             json={"challenge_seed": challenge_seed},
             timeout=self.timeout_s,
+            verify=self.verify_ssl,
         )
         resp.raise_for_status()
 
     def cancel_job(self, job_id: str) -> None:
         url = f"{self.endpoint}/capacity-audit/v1/jobs/{job_id}"
         try:
-            httpx.delete(url, headers=self._headers(), timeout=self.timeout_s)
+            httpx.delete(url, headers=self._headers(), timeout=self.timeout_s, verify=self.verify_ssl)
         except Exception:
             pass
 
