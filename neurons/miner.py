@@ -190,6 +190,62 @@ def _apply_proxy_hardware_server_args(server_args: list[str], args) -> list[str]
     return server_args
 
 
+def _require_proxy_advertised_hardware(args, *, capacity_audit: bool) -> None:
+    """Fail fast when proxy mode cannot expose audit GPU metadata via /health."""
+    if not capacity_audit:
+        return
+    gpu_name = _proxy_advertised_gpu_name(args)
+    vram_gb = _proxy_advertised_vram_gb(args)
+    if gpu_name and vram_gb and vram_gb > 0:
+        return
+    bt.logging.error(
+        "Proxy mode with --capacity-audit requires audit GPU metadata for /health. "
+        "Set VERATHOS_ADVERTISED_GPU_NAME (exact calibrated class string) and "
+        "VERATHOS_ADVERTISED_VRAM_GB, or pass --advertised-gpu-name and "
+        "--advertised-vram-gb. Validators use /health hardware to schedule capacity "
+        "audits and apply the model gate at scoring time."
+    )
+    sys.exit(1)
+
+
+def _verify_proxy_health_hardware(local_health_url: str, args) -> None:
+    """Confirm proxy /health exposes the configured audit GPU, not inference hardware."""
+    gpu_name = _proxy_advertised_gpu_name(args)
+    vram_gb = _proxy_advertised_vram_gb(args)
+    if not gpu_name or not vram_gb or vram_gb <= 0:
+        return
+    try:
+        from verallm.registry.gpu import normalize_marketed_vram_gb
+
+        resp = httpx.get(f"{local_health_url.rstrip('/')}/health", timeout=5.0)
+        resp.raise_for_status()
+        hw = (resp.json() or {}).get("hardware") or {}
+        reported_name = str(hw.get("gpu_name") or "").strip()
+        reported_vram = normalize_marketed_vram_gb(int(hw.get("vram_gb") or 0))
+        expected_vram = normalize_marketed_vram_gb(int(vram_gb))
+        if reported_name.lower() != gpu_name.lower():
+            bt.logging.error(
+                f"Proxy /health hardware mismatch: gpu_name={reported_name!r} "
+                f"expected {gpu_name!r}. Inference mirroring must not replace "
+                "advertised audit GPU metadata."
+            )
+            sys.exit(1)
+        if reported_vram != expected_vram:
+            bt.logging.error(
+                f"Proxy /health hardware mismatch: vram_gb={reported_vram} "
+                f"expected {expected_vram}. Check VERATHOS_ADVERTISED_VRAM_GB."
+            )
+            sys.exit(1)
+        bt.logging.success(
+            f"Proxy /health audit GPU verified: {reported_name} {reported_vram}GB"
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        bt.logging.error(f"Proxy /health audit GPU verification failed: {exc}")
+        sys.exit(1)
+
+
 def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
     address = "".join(
         c for c in str(evm_address or "unknown").lower()
@@ -1673,10 +1729,30 @@ def main():
         config.proxy_balancer_key = args.proxy_balancer_key
     if getattr(args, "proxy_llm_key", None):
         config.proxy_llm_key = args.proxy_llm_key
-    if getattr(args, "capacity_audit_balancer", None):
-        config.capacity_audit_balancer = args.capacity_audit_balancer
-    if getattr(args, "capacity_audit_balancer_key", None):
-        config.capacity_audit_balancer_key = args.capacity_audit_balancer_key
+    audit_balancer = str(
+        getattr(args, "capacity_audit_balancer", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_URL", "")
+        or ""
+    ).strip()
+    if audit_balancer:
+        config.capacity_audit_balancer = audit_balancer
+    audit_balancer_key = str(
+        getattr(args, "capacity_audit_balancer_key", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_API_KEY", "")
+        or ""
+    ).strip()
+    if audit_balancer_key:
+        config.capacity_audit_balancer_key = audit_balancer_key
+    if (
+        getattr(config, "proxy_mode", False)
+        and getattr(config, "capacity_audit_enabled", False)
+        and not str(getattr(config, "capacity_audit_balancer", "") or "").strip()
+    ):
+        bt.logging.error(
+            "Proxy mode with --capacity-audit requires --capacity-audit-balancer "
+            "(or CAPACITY_AUDIT_BALANCER_URL) for remote audit execution."
+        )
+        sys.exit(1)
 
     # ── Early on-chain model check ───────────────────────────────
     # Verify the resolved model is registered on-chain BEFORE loading
@@ -1793,6 +1869,10 @@ def main():
             server_args.append("--skip-gpu-check")
         if "--proxy-mode" not in server_args:
             server_args.append("--proxy-mode")
+        _require_proxy_advertised_hardware(
+            args,
+            capacity_audit=bool(getattr(config, "capacity_audit_enabled", False)),
+        )
         if getattr(config, "proxy_balancer", "") and "--proxy-balancer" not in server_args:
             server_args.extend(["--proxy-balancer", str(config.proxy_balancer)])
         proxy_balancer_key = str(
@@ -1855,6 +1935,8 @@ def main():
     # port from server_args (mirrors the server's own --port default of 8000).
     local_health_url = f"http://localhost:{_extract_server_port(server_args)}"
     neuron.wait_for_health(local_health_url, server_args=server_args)
+    if getattr(config, "proxy_mode", False):
+        _verify_proxy_health_hardware(local_health_url, args)
 
     # Start background refresh loop (periodic updates)
     if args.wallet:
@@ -1901,14 +1983,6 @@ def main():
                 vram_gb=vram_gb,
                 on_chain_models=on_chain_models,
             )
-            if not ok and getattr(config, "proxy_mode", False) and on_chain_models:
-                on_chain_set = {str(m).lower() for m in on_chain_models}
-                if str(resolved.model_id).lower() in on_chain_set:
-                    bt.logging.warning(
-                        f"Proxy mode: capacity model gate waived for on-chain model "
-                        f"{resolved.model_id} ({reason})"
-                    )
-                    ok = True
             if not ok:
                 expected_text = ""
                 if expected is not None:

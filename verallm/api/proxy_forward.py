@@ -30,6 +30,7 @@ class ProxyInferenceState:
         self.verify_upstream_ssl: bool = True
         self.mirror_health_url: str = ""
         self.advertised_gpu_uuids: list[str] = []
+        self.advertised_hardware: bool = False
 
 
 proxy_state = ProxyInferenceState()
@@ -80,6 +81,59 @@ def _parse_advertised_gpu_uuids(args=None) -> list[str]:
     return [u.strip() for u in raw.split(",") if u.strip()]
 
 
+def advertised_hardware_dict(args=None) -> dict[str, object]:
+    """Return configured audit-GPU hardware for proxy /health (CLI or env)."""
+    gpu_name = str(
+        getattr(args, "advertised_gpu_name", "")
+        or os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "")
+        or ""
+    ).strip()
+    vram_gb = getattr(args, "advertised_vram_gb", None) if args is not None else None
+    if vram_gb is None:
+        raw = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+        vram_gb = int(raw) if str(raw).strip().isdigit() else 0
+    else:
+        vram_gb = int(vram_gb or 0)
+
+    gpu_count = getattr(args, "advertised_gpu_count", None) if args is not None else None
+    if gpu_count is None:
+        raw = os.environ.get("VERATHOS_ADVERTISED_GPU_COUNT", "1")
+        gpu_count = int(raw) if str(raw).strip().isdigit() else 1
+    else:
+        gpu_count = int(gpu_count or 1)
+
+    compute_capability = str(
+        (
+            getattr(args, "advertised_compute_capability", "")
+            if args is not None
+            else ""
+        )
+        or os.environ.get("VERATHOS_ADVERTISED_COMPUTE_CAPABILITY", "")
+        or ""
+    ).strip()
+
+    uuids = _parse_advertised_gpu_uuids(args)
+    if not gpu_name or vram_gb <= 0:
+        return {}
+    return {
+        "gpu_name": gpu_name,
+        "gpu_count": max(1, int(gpu_count)),
+        "vram_gb": int(vram_gb),
+        "compute_capability": compute_capability,
+        "gpu_uuids": uuids,
+    }
+
+
+def has_advertised_hardware(result: Optional[dict] = None) -> bool:
+    if proxy_state.advertised_hardware:
+        return True
+    if isinstance(result, dict):
+        hw = result.get("hardware")
+        if isinstance(hw, dict):
+            return bool(str(hw.get("gpu_name") or "").strip()) and int(hw.get("vram_gb") or 0) > 0
+    return bool(advertised_hardware_dict())
+
+
 def _configured_proxy_gpu_uuids(result: Optional[dict] = None) -> list[str]:
     if isinstance(result, dict):
         hw = result.get("hardware")
@@ -93,7 +147,7 @@ def _configured_proxy_gpu_uuids(result: Optional[dict] = None) -> list[str]:
 
 
 def merge_upstream_health(result: dict) -> dict:
-    """Proxy /health reflects the inference GPU reached via Balancer 1 /pick."""
+    """Mirror inference load/KV stats from upstream; keep audit GPU in hardware."""
     upstream: Optional[dict] = None
 
     # Optional pin for debugging; normal proxy miners use balancer /pick only.
@@ -116,6 +170,19 @@ def merge_upstream_health(result: dict) -> dict:
     for key in ("model", *_mirror_health_fields()):
         if key in upstream:
             result[key] = upstream[key]
+
+    # Validators use /health hardware for capacity-audit cohorts and model gate.
+    # When audit GPU is advertised (remote capacity audit), never replace it with
+    # the inference tier reached via Balancer 1.
+    if has_advertised_hardware(result):
+        hw = dict(result.get("hardware") or {})
+        proxy_uuids = _configured_proxy_gpu_uuids(result)
+        if proxy_uuids:
+            hw["gpu_uuids"] = proxy_uuids
+        if hw:
+            result["hardware"] = hw
+        return result
+
     if isinstance(upstream.get("hardware"), dict) and upstream["hardware"]:
         hw = dict(upstream["hardware"])
         proxy_uuids = _configured_proxy_gpu_uuids(result)
@@ -164,32 +231,20 @@ def configure_proxy_from_args(args) -> None:
 
 def apply_advertised_hardware(state, args) -> None:
     """Populate /health hardware from CLI/env on proxy nodes without CUDA."""
-    gpu_name = str(getattr(args, "advertised_gpu_name", "") or os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "") or "")
-    vram_gb = getattr(args, "advertised_vram_gb", None)
-    if vram_gb is None:
-        raw = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
-        vram_gb = int(raw) if str(raw).strip().isdigit() else 0
-    gpu_count = getattr(args, "advertised_gpu_count", None)
-    if gpu_count is None:
-        raw = os.environ.get("VERATHOS_ADVERTISED_GPU_COUNT", "1")
-        gpu_count = int(raw) if str(raw).strip().isdigit() else 1
-    compute_capability = str(
-        getattr(args, "advertised_compute_capability", "")
-        or os.environ.get("VERATHOS_ADVERTISED_COMPUTE_CAPABILITY", "")
-        or ""
-    )
-    uuids = _parse_advertised_gpu_uuids(args)
-    if gpu_name:
-        state.gpu_name = gpu_name
-    if vram_gb:
-        state.vram_gb = int(vram_gb)
-    if gpu_count:
-        state.gpu_count = int(gpu_count)
-    if compute_capability:
-        state.compute_capability = compute_capability
-    if uuids:
-        state.gpu_uuids = uuids
-        proxy_state.advertised_gpu_uuids = uuids
+    hw = advertised_hardware_dict(args)
+    if not hw:
+        proxy_state.advertised_hardware = False
+        return
+    state.gpu_name = str(hw["gpu_name"])
+    state.vram_gb = int(hw["vram_gb"])
+    state.gpu_count = int(hw["gpu_count"])
+    if hw.get("compute_capability"):
+        state.compute_capability = str(hw["compute_capability"])
+    uuids = hw.get("gpu_uuids") or []
+    if isinstance(uuids, list) and uuids:
+        state.gpu_uuids = list(uuids)
+        proxy_state.advertised_gpu_uuids = list(uuids)
+    proxy_state.advertised_hardware = True
 
 
 def _balancer_headers() -> dict[str, str]:

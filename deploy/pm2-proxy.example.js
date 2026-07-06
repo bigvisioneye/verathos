@@ -1,6 +1,11 @@
 // Example PM2 config: proxy VPS (side 1) — no GPU, forwards /chat + remote capacity audit.
 //
 //   pm2 start deploy/pm2-proxy.example.js --only proxy-slot-a
+//
+// IMPORTANT:
+// - /health hardware must match the audit worker GPU class (not the inference GPU).
+// - --model-id / --quant must pass the validator capacity model gate for advertised VRAM.
+// - Set VERATHOS_ADVERTISED_GPU_NAME via env when the name contains spaces.
 
 module.exports = {
   apps: [
@@ -23,8 +28,8 @@ module.exports = {
         "--proxy-llm-key", "REPLACE_PROXY_LLM_KEY",
         "--capacity-audit-balancer", "http://10.0.0.10:8081",
         "--capacity-audit-balancer-key", "REPLACE_BALANCER2_KEY",
-        "--advertised-vram-gb", "80",
-        "--advertised-gpu-uuids", "af0b6e27-71dd-4c09-bca2-d7408c800f6a",
+        "--advertised-vram-gb", "40",
+        "--advertised-gpu-uuids", "REPLACE_A100_GPU_UUID",
         "--",
         "--port", "9062",
         "--proxy-mode",
@@ -32,10 +37,9 @@ module.exports = {
       ],
       cwd: "/workspace/verathos",
       env: {
-        VERATHOS_ADVERTISED_GPU_NAME: "NVIDIA A100-SXM4-80GB",
-        VERATHOS_ADVERTISED_VRAM_GB: "80",
+        VERATHOS_ADVERTISED_GPU_NAME: "NVIDIA A100-SXM4-40GB",
+        VERATHOS_ADVERTISED_VRAM_GB: "40",
         // Set to 0 if Balancer 1 returns https:// GPU endpoints with self-signed certs.
-        // Prefer registering inference GPUs as http:// in Balancer 1 when possible.
         PROXY_UPSTREAM_VERIFY_SSL: "0",
       },
       autorestart: true,

@@ -55,6 +55,7 @@ from neurons.subnet_runtime_config import (
     apply_runtime_config_to_neuron_config,
     capacity_audit_config_from_neuron_config,
 )
+from verallm.api.proxy_forward import advertised_hardware_dict
 
 
 @dataclass(frozen=True)
@@ -1123,8 +1124,22 @@ class CapacityAuditMinerWorker:
             out.append(url)
         return out
 
+    def _apply_advertised_hardware_to_miner(self, miner: ActiveMiner) -> bool:
+        hw = advertised_hardware_dict()
+        if not hw:
+            return False
+        miner.gpu_name = str(hw.get("gpu_name") or "")
+        miner.gpu_count = int(hw.get("gpu_count") or 1)
+        miner.vram_gb = int(hw.get("vram_gb") or 0)
+        miner.compute_capability = str(hw.get("compute_capability") or "")
+        uuids = hw.get("gpu_uuids") or []
+        miner.gpu_uuids = uuids if isinstance(uuids, list) else []
+        return bool(miner.gpu_name and miner.vram_gb > 0)
+
     def _enrich_hardware(self, miners: list[ActiveMiner]) -> None:
         for miner in miners:
+            if self._use_remote_audit() and self._apply_advertised_hardware_to_miner(miner):
+                continue
             for base_url in self._health_urls_for_miner(miner):
                 try:
                     resp = httpx.get(f"{base_url}/health", timeout=3.0)
