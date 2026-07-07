@@ -1749,10 +1749,18 @@ class CapacityAuditMinerWorker:
                             f"audit_id={audit_slot.audit_id[:12]}"
                         )
                     else:
-                        self._publish_proof(proof_payload)
-                        bt.logging.info(
-                            f"Capacity audit artifacts published (remote): audit_id={audit_slot.audit_id[:12]}"
-                        )
+                        accepted = self._publish_proof(proof_payload) or 0
+                        if accepted > 0:
+                            bt.logging.info(
+                                f"Capacity audit artifacts published (remote): "
+                                f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                            )
+                        else:
+                            bt.logging.info(
+                                f"Capacity audit artifacts not accepted by validators (remote): "
+                                f"audit_id={audit_slot.audit_id[:12]} "
+                                "slot was not scheduled or endpoints were unavailable"
+                            )
             elif not final_sent:
                 bt.logging.warning(
                     f"Capacity audit remote workload did not produce final receipt: "
@@ -1986,18 +1994,32 @@ class CapacityAuditMinerWorker:
                     f"stderr_tail={stderr[-500:]} stdout_tail={stdout[-300:]}"
                 )
             else:
-                accepted = self._publish_proof(proof_payload) or 0
-                if accepted > 0:
-                    bt.logging.info(
-                        f"Capacity audit artifacts published: "
-                        f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                proof_payload = self._proof_payload_artifact(
+                    audit_slot,
+                    pass0_root=pass0_root,
+                    final_root=final_root,
+                    transcript=transcript,
+                    lease=lease,
+                    final_summary=final_summary,
+                )
+                if proof_payload is None:
+                    bt.logging.warning(
+                        f"Capacity audit proof payload missing verifier proof: "
+                        f"audit_id={audit_slot.audit_id[:12]}"
                     )
                 else:
-                    bt.logging.info(
-                        f"Capacity audit artifacts not accepted by validators: "
-                        f"audit_id={audit_slot.audit_id[:12]} "
-                        "slot was not scheduled or endpoints were unavailable"
-                    )
+                    accepted = self._publish_proof(proof_payload) or 0
+                    if accepted > 0:
+                        bt.logging.info(
+                            f"Capacity audit artifacts published: "
+                            f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                        )
+                    else:
+                        bt.logging.info(
+                            f"Capacity audit artifacts not accepted by validators: "
+                            f"audit_id={audit_slot.audit_id[:12]} "
+                            "slot was not scheduled or endpoints were unavailable"
+                        )
         self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
         self._clear_audit_drain(audit_slot.audit_id)
 
