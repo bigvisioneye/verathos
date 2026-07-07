@@ -16,6 +16,16 @@ COMBINED_PROOF_FORMAT = "hot_capacity_combined_proof_v1"
 COMBINED_WORKLOAD_VERSION = "hot_capacity_combined"
 
 
+def proof_summary_ready(final_summary: object) -> bool:
+    """True when the worker final.json contains a publishable combined proof."""
+    if not isinstance(final_summary, dict):
+        return False
+    proof_payload = final_summary.get("proof_payload")
+    if not isinstance(proof_payload, dict):
+        return False
+    return str(proof_payload.get("format") or "") == COMBINED_PROOF_FORMAT
+
+
 def _ensure_workspace_path() -> None:
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))

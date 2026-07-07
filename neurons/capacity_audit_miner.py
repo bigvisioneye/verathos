@@ -45,7 +45,7 @@ from neurons.capacity_audit import (
     slot_id,
     transcript_root,
 )
-from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT
+from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT, proof_summary_ready
 from neurons.capacity_audit_balancer import CapacityAuditBalancerClient
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 from neurons.capacity_audit_remote import RemoteAuditClient
@@ -1698,6 +1698,11 @@ class CapacityAuditMinerWorker:
                         )
                         if challenge_seed:
                             remote.submit_proof_challenge(job_id, challenge_seed)
+                            bt.logging.info(
+                                f"Capacity audit proof challenge submitted (remote): "
+                                f"audit_id={audit_slot.audit_id[:12]} job_id={job_id[:12]} "
+                                f"seed_len={len(challenge_seed)}"
+                            )
                         else:
                             bt.logging.warning(
                                 f"Capacity audit proof challenge unavailable: "
@@ -1707,16 +1712,27 @@ class CapacityAuditMinerWorker:
                 time.sleep(0.05)
 
             if final_sent and remote is not None:
-                proof_timeout = max(5.0, float(self.runtime_cfg.payload_deadline_s or 0.0) + 30.0)
+                proof_timeout = max(120.0, float(self.runtime_cfg.payload_deadline_s or 0.0) + 90.0)
+                bt.logging.info(
+                    f"Capacity audit waiting for remote proof summary: "
+                    f"audit_id={audit_slot.audit_id[:12]} job_id={job_id[:12]} "
+                    f"timeout_s={proof_timeout:.0f}"
+                )
                 try:
-                    status = remote.wait_for_phase(job_id, "proof_ready", timeout_s=proof_timeout)
-                except TimeoutError:
+                    status = remote.wait_for_proof_summary(job_id, timeout_s=proof_timeout)
+                except TimeoutError as exc:
                     status = remote.get_job(job_id)
+                    bt.logging.warning(
+                        f"Capacity audit remote proof wait timed out: "
+                        f"audit_id={audit_slot.audit_id[:12]} job_id={job_id[:12]} "
+                        f"phase={status.phase} err={exc}"
+                    )
                 final_summary = dict(status.final_summary or {})
-                if not final_summary:
+                if not proof_summary_ready(final_summary):
                     bt.logging.warning(
                         f"Capacity audit remote missing final proof summary: "
-                        f"audit_id={audit_slot.audit_id[:12]} phase={status.phase}"
+                        f"audit_id={audit_slot.audit_id[:12]} phase={status.phase} "
+                        f"job_id={job_id[:12]} summary_keys={sorted(final_summary.keys())}"
                     )
                 else:
                     proof_payload = self._proof_payload_artifact(
@@ -1748,6 +1764,10 @@ class CapacityAuditMinerWorker:
             )
         finally:
             if remote is not None and job_id:
+                bt.logging.info(
+                    f"Capacity audit remote job cleanup: audit_id={audit_slot.audit_id[:12]} "
+                    f"job_id={job_id[:12]} final_sent={final_sent}"
+                )
                 remote.cancel_job(job_id)
             if worker_lease is not None:
                 try:
@@ -1957,28 +1977,31 @@ class CapacityAuditMinerWorker:
                     final_summary = json.loads(final_summary_path.read_text())
                 except Exception:
                     final_summary = {}
-            else:
+            if not proof_summary_ready(final_summary):
                 bt.logging.warning(
                     f"Capacity audit workload missing final proof summary: "
                     f"audit_id={audit_slot.audit_id[:12]} rc={proc.poll()} "
+                    f"path_exists={final_summary_path.exists()} "
+                    f"summary_keys={sorted(final_summary.keys())} "
                     f"stderr_tail={stderr[-500:]} stdout_tail={stdout[-300:]}"
                 )
-            proof_payload = self._proof_payload_artifact(
-                audit_slot,
-                pass0_root=pass0_root,
-                final_root=final_root,
-                transcript=transcript,
-                lease=lease,
-                final_summary=final_summary,
-            )
-            if proof_payload is None:
-                bt.logging.warning(
-                    f"Capacity audit proof payload missing verifier proof: "
-                    f"audit_id={audit_slot.audit_id[:12]}"
-                )
             else:
-                self._publish_proof(proof_payload)
-                bt.logging.info(f"Capacity audit artifacts published: audit_id={audit_slot.audit_id[:12]}")
+                proof_payload = self._proof_payload_artifact(
+                    audit_slot,
+                    pass0_root=pass0_root,
+                    final_root=final_root,
+                    transcript=transcript,
+                    lease=lease,
+                    final_summary=final_summary,
+                )
+                if proof_payload is None:
+                    bt.logging.warning(
+                        f"Capacity audit proof payload missing verifier proof: "
+                        f"audit_id={audit_slot.audit_id[:12]}"
+                    )
+                else:
+                    self._publish_proof(proof_payload)
+                    bt.logging.info(f"Capacity audit artifacts published: audit_id={audit_slot.audit_id[:12]}")
         self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
         self._clear_audit_drain(audit_slot.audit_id)
 
@@ -2155,6 +2178,10 @@ class CapacityAuditMinerWorker:
                         continue
                     if resp.status_code < 300:
                         self._record_validator_publish_result(base, True)
+                        bt.logging.info(
+                            f"Capacity audit publish ok: audit_id={audit_id[:12]} "
+                            f"type={artifact_type} url={base}{path} status={resp.status_code}"
+                        )
                         continue
                     retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
                     bt.logging.warning(

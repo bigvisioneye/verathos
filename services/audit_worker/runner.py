@@ -17,6 +17,17 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_COMBINED_PROOF_FORMAT = "hot_capacity_combined_proof_v1"
+
+
+def _proof_summary_ready(final_summary: object) -> bool:
+    if not isinstance(final_summary, dict):
+        return False
+    proof_payload = final_summary.get("proof_payload")
+    if not isinstance(proof_payload, dict):
+        return False
+    return str(proof_payload.get("format") or "") == _COMBINED_PROOF_FORMAT
+
 
 def _root_hex(raw: object) -> str:
     if isinstance(raw, str):
@@ -49,6 +60,7 @@ class AuditJobRecord:
     pass0_root: str = ""
     final_timing: dict = field(default_factory=dict)
     final_summary: dict = field(default_factory=dict)
+    proof_pending_logged: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
     monitor_thread: Optional[threading.Thread] = None
 
@@ -161,10 +173,10 @@ class AuditJobRunner:
                             )
                     except Exception:
                         pass
-                if final_summary_path.exists() and not record.final_summary:
+                if final_summary_path.exists() and not _proof_summary_ready(record.final_summary):
                     try:
                         data = json.loads(final_summary_path.read_text())
-                        if isinstance(data, dict):
+                        if _proof_summary_ready(data):
                             record.final_summary = data
                             record.phase = "proof_ready"
                             logger.info(
@@ -173,17 +185,35 @@ class AuditJobRunner:
                                 record.audit_id[:12],
                                 record.lease_id[:12],
                             )
+                        elif not record.proof_pending_logged:
+                            record.proof_pending_logged = True
+                            size = final_summary_path.stat().st_size
+                            logger.info(
+                                "audit job proof file pending: job_id=%s audit_id=%s lease=%s "
+                                "bytes=%d phase=%s",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                                size,
+                                record.phase,
+                            )
+                    except json.JSONDecodeError:
+                        if not record.proof_pending_logged:
+                            record.proof_pending_logged = True
+                            size = final_summary_path.stat().st_size
+                            logger.info(
+                                "audit job proof file incomplete: job_id=%s audit_id=%s lease=%s "
+                                "bytes=%d phase=%s",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                                size,
+                                record.phase,
+                            )
                     except Exception:
                         pass
-            if record.phase == "final_ready" and final_summary_path.exists():
-                with record.lock:
-                    if not record.final_summary:
-                        try:
-                            record.final_summary = json.loads(final_summary_path.read_text())
-                        except Exception:
-                            record.final_summary = {}
-                    record.phase = "proof_ready"
-                break
+                if _proof_summary_ready(record.final_summary):
+                    break
             time.sleep(0.02)
         rc = proc.poll()
         with record.lock:
@@ -213,8 +243,16 @@ class AuditJobRunner:
                         record.error = "final timing unreadable"
                 if final_summary_path.exists():
                     try:
-                        record.final_summary = json.loads(final_summary_path.read_text())
-                        record.phase = "proof_ready"
+                        data = json.loads(final_summary_path.read_text())
+                        if _proof_summary_ready(data):
+                            record.final_summary = data
+                            record.phase = "proof_ready"
+                            logger.info(
+                                "audit job proof ready after exit: job_id=%s audit_id=%s lease=%s",
+                                record.job_id[:12],
+                                record.audit_id[:12],
+                                record.lease_id[:12],
+                            )
                     except Exception:
                         pass
 

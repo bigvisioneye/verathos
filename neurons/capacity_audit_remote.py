@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
+from neurons.capacity_audit_combined import proof_summary_ready
 from verallm.api.proxy_auth import AUDIT_WORKER_HEADER
 
 
@@ -126,3 +127,30 @@ class RemoteAuditClient:
                 return status
             time.sleep(max(0.02, float(poll_s)))
         raise TimeoutError(f"remote audit job {job_id} timed out waiting for {target}")
+
+    def wait_for_proof_summary(
+        self,
+        job_id: str,
+        *,
+        timeout_s: float,
+        poll_s: float = 0.05,
+    ) -> RemoteAuditJobStatus:
+        deadline = time.time() + max(1.0, float(timeout_s))
+        premature_phase = False
+        while time.time() < deadline:
+            status = self.get_job(job_id)
+            if status.phase == "failed":
+                raise RuntimeError(status.error or "remote audit job failed")
+            if proof_summary_ready(status.final_summary):
+                return status
+            if status.phase == "proof_ready" and not premature_phase:
+                premature_phase = True
+            time.sleep(max(0.02, float(poll_s)))
+        status = self.get_job(job_id)
+        detail = (
+            f"phase={status.phase} premature_proof_ready={premature_phase} "
+            f"summary_keys={sorted(status.final_summary.keys()) if status.final_summary else []}"
+        )
+        raise TimeoutError(
+            f"remote audit job {job_id} timed out waiting for proof summary ({detail})"
+        )
