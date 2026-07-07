@@ -6,6 +6,11 @@
 // - /health hardware must match the audit worker GPU class (not the inference GPU).
 // - --model-id / --quant must pass the validator capacity model gate for advertised VRAM.
 // - Set VERATHOS_ADVERTISED_GPU_NAME via env when the name contains spaces.
+// - Capacity audit requires hosted subnet runtime config (windows_per_epoch=5 on mainnet).
+//   On startup you should see: "Applied runtime subnet config version=... source=server"
+//   If fetch fails from the proxy VPS, seed cache once:
+//     mkdir -p ~/.verathos && curl -o ~/.verathos/subnet_config_cache.json https://api.verathos.ai/v1/subnet-config
+//   Or pass CLI overrides that match hosted config, e.g. --capacity-audit-windows-per-epoch 5
 
 module.exports = {
   apps: [

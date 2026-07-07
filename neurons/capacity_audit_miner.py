@@ -169,7 +169,10 @@ class CapacityAuditMinerWorker:
         )
         self._subnet_runtime_config_key: tuple[int, Optional[int], str] | None = None
         self._subnet_runtime_config_authoritative = False
+        self._subnet_runtime_config_warn_epoch = -1
         self._refresh_subnet_runtime_config(force=True)
+        if not self._subnet_runtime_config_authoritative:
+            self._warn_missing_subnet_runtime_config(raise_in_strict_mode=True)
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._pending: dict[int, list[MinerAuditSlot]] = {}
@@ -217,6 +220,26 @@ class CapacityAuditMinerWorker:
             f"effective_epoch={runtime.effective_epoch} source={runtime.source or 'server'}"
         )
         return True
+
+    def _warn_missing_subnet_runtime_config(self, *, raise_in_strict_mode: bool = False) -> None:
+        url = str(getattr(self.config, "subnet_config_url", "") or "").strip()
+        cache_path = str(
+            getattr(self._subnet_runtime_config_client, "cache_path", "")
+            or getattr(self.config, "subnet_config_cache_path", "")
+            or ""
+        ).strip()
+        windows = int(getattr(self.runtime_cfg, "windows_per_epoch", 0) or 0)
+        message = (
+            "Capacity audit subnet runtime config is not loaded; local audit windows "
+            "will not match validators (unknown audit slot). "
+            f"Fetch {url or 'the hosted subnet config'} or seed cache at {cache_path or '~/.verathos/subnet_config_cache.json'}. "
+            f"Current fallback windows_per_epoch={windows} "
+            "(hosted mainnet uses 5)."
+        )
+        mode = str(getattr(self.runtime_cfg, "mode", "observe") or "observe")
+        if raise_in_strict_mode and mode != "observe":
+            raise RuntimeError(message)
+        bt.logging.warning(message)
 
     def _write_audit_state(self, payload: dict) -> None:
         if self.audit_state_file is None:
@@ -767,10 +790,15 @@ class CapacityAuditMinerWorker:
             current_epoch = int(block_number // epoch_blocks)
             self._refresh_subnet_runtime_config(current_epoch=current_epoch, force=True)
             epoch_blocks = self._epoch_blocks(subtensor)
-        if (
-            getattr(self, "_subnet_runtime_config_authoritative", False)
-            and not getattr(self.runtime_cfg, "enabled", False)
-        ):
+        elif not getattr(self, "_subnet_runtime_config_authoritative", False):
+            self._refresh_subnet_runtime_config(force=False)
+        if not getattr(self, "_subnet_runtime_config_authoritative", False):
+            current_epoch = int(block_number // max(1, epoch_blocks))
+            if current_epoch != int(getattr(self, "_subnet_runtime_config_warn_epoch", -1)):
+                self._subnet_runtime_config_warn_epoch = current_epoch
+                self._warn_missing_subnet_runtime_config()
+            return
+        if not getattr(self.runtime_cfg, "enabled", False):
             return
         if not capacity_audit_window_triggered(
             block_number,
@@ -824,10 +852,48 @@ class CapacityAuditMinerWorker:
             self._mark_audit_drain(audit_slot, phase="selected")
             self._pending.setdefault(int(audit_slot.audit_block), []).append(audit_slot)
             self._start_audit_waiter(audit_slot)
-            bt.logging.info(
-                f"Capacity audit selected local slot: audit_id={audit_slot.audit_id[:12]} "
-                f"B_select={block_number} B_start={audit_slot.audit_block}"
+            self._log_selected_slot_diagnostics(
+                audit_slot,
+                selection_block=block_number,
+                epoch_blocks=epoch_blocks,
+                selection_block_hash=block_hash,
             )
+
+    def _log_selected_slot_diagnostics(
+        self,
+        audit_slot: MinerAuditSlot,
+        *,
+        selection_block: int,
+        epoch_blocks: int,
+        selection_block_hash: Optional[bytes],
+    ) -> None:
+        """Log audit_id inputs so operators can compare against validator scheduling logs."""
+        cfg = self.runtime_cfg
+        epoch_number = int(selection_block // max(1, int(epoch_blocks or 1)))
+        hash_hex = bytes(selection_block_hash or b"").hex()
+        config_key = getattr(self, "_subnet_runtime_config_key", None)
+        config_label = "unloaded"
+        if config_key:
+            config_label = f"v{config_key[0]}:{config_key[2]}"
+        authoritative = bool(getattr(self, "_subnet_runtime_config_authoritative", False))
+        bt.logging.info(
+            f"Capacity audit selected local slot: audit_id={audit_slot.audit_id[:12]} "
+            f"B_select={selection_block} B_start={audit_slot.audit_block} "
+            f"B_proof={audit_slot.proof_challenge_block} "
+            f"chain_id={int(getattr(self.config, 'chain_id', 0) or 0)} "
+            f"netuid={int(getattr(self.config, 'netuid', 0) or 0)} "
+            f"epoch={epoch_number} epoch_blocks={int(epoch_blocks)} "
+            f"windows_per_epoch={int(cfg.windows_per_epoch or 0)} "
+            f"cohort_fraction={float(cfg.cohort_fraction or 0.0):g} "
+            f"beacon_hashes={int(cfg.beacon_hash_count or 1)} "
+            f"cohort_seed={str(audit_slot.cohort_seed or '')[:16]} "
+            f"B_select_hash={hash_hex[:16]} "
+            f"slot_id={slot_id(audit_slot.slot)[:12]} "
+            f"model_index={int(audit_slot.slot.model_index)} "
+            f"passes={int(audit_slot.passes)} "
+            f"gpu={audit_slot.gpu_class_name} "
+            f"subnet_config={config_label} authoritative={authoritative}"
+        )
 
     def _start_audit_waiter(self, audit_slot: MinerAuditSlot) -> None:
         thread = threading.Thread(
