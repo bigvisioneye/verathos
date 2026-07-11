@@ -53,6 +53,7 @@ from neurons.capacity_audit import (
     CapacityAuditRuntimeConfig,
     CapacitySlot,
     PROTOCOL_VERSION,
+    apply_window_cohort_selection,
     build_capacity_slot_group_key,
     capacity_audit_window_fits_epoch,
     capacity_audit_window_triggered,
@@ -1588,19 +1589,16 @@ class ValidatorNeuron:
             cohort_seed = derive_audit_seed(selection_block_hash, epoch_number)
         else:
             cohort_seed = derive_audit_seed_from_hashes(seed_hashes, epoch_number)
-        selected = select_capacity_audit_slots(
+        selected, before_budget = apply_window_cohort_selection(
             [slot for slot, _row in active],
             cohort_seed,
             cfg,
         )
         if not selected:
             return
-        budget = window_cohort_budget(len(active), cfg)
-        if budget > 0 and len(selected) > budget:
-            before = len(selected)
-            selected = deterministic_sample_slots(selected, cohort_seed, budget)
+        if before_budget > len(selected):
             bt.logging.info(
-                f"Capacity audit: truncated selected slots {before}->{len(selected)} "
+                f"Capacity audit: truncated selected slots {before_budget}->{len(selected)} "
                 f"by per-window drain budget at block {selection_block}"
             )
         supported_fn = getattr(self, "_capacity_audit_supported_slots_by_id", None)

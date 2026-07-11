@@ -881,8 +881,10 @@ def select_capacity_audit_slots(
     """Select slots by per-slot public hash predicates.
 
     The selection is deterministic from the public seed plus each endpoint's
-    chain-advertised metadata. It intentionally does not require miners to know
-    the global miner set or exact cohort budget.
+    chain-advertised metadata. Validators then apply ``window_cohort_budget``
+    truncation via :func:`apply_window_cohort_selection`; miners that only
+    check this helper without the budget step can false-positive and waste GPU
+    on audits validators will reject.
     """
     unique = {slot_id(slot): slot for slot in slots}
     selected = [
@@ -890,6 +892,27 @@ def select_capacity_audit_slots(
         if capacity_audit_slot_selected(slot, audit_seed_hex, cfg)
     ]
     return sorted(selected, key=lambda s: (s.address_lower, s.model_index, s.endpoint))
+
+
+def apply_window_cohort_selection(
+    slots: Iterable[CapacitySlot],
+    audit_seed_hex: str,
+    cfg: CapacityAuditRuntimeConfig,
+) -> tuple[list[CapacitySlot], int]:
+    """Apply probabilistic slot selection plus per-window cohort budget.
+
+    Returns ``(budgeted_slots, pre_budget_count)`` where ``pre_budget_count``
+    is how many slots matched the per-slot predicate before truncation.
+    """
+    active = list(slots)
+    selected = select_capacity_audit_slots(active, audit_seed_hex, cfg)
+    before = len(selected)
+    if not selected:
+        return [], before
+    budget = window_cohort_budget(len(active), cfg)
+    if budget > 0 and len(selected) > budget:
+        selected = deterministic_sample_slots(selected, audit_seed_hex, budget)
+    return selected, before
 
 
 def _canonical_gpu_name(gpu_name: str) -> str:

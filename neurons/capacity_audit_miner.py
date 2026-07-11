@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +27,7 @@ from neurons.capacity_audit import (
     CapacityAuditRuntimeConfig,
     CapacitySlot,
     PROTOCOL_VERSION,
+    apply_window_cohort_selection,
     build_capacity_slot_group_key,
     capacity_audit_slot_selected,
     capacity_audit_window_fits_epoch,
@@ -49,7 +50,7 @@ from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT, proof_summary
 from neurons.capacity_audit_balancer import CapacityAuditBalancerClient
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 from neurons.capacity_audit_remote import RemoteAuditClient
-from neurons.discovery import ActiveMiner
+from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.subnet_runtime_config import (
     RuntimeSubnetConfigClient,
     apply_runtime_config_to_neuron_config,
@@ -188,6 +189,15 @@ class CapacityAuditMinerWorker:
         self._workspace_ext_ready = False
         self._resolved_epoch_blocks: Optional[int] = None
         self._audit_endpoint_rejections: dict[str, set[str]] = {}
+        self._cohort_snapshot_lock = threading.Lock()
+        self._cohort_snapshot: list[tuple[CapacitySlot, object]] = []
+        self._cohort_snapshot_block = 0
+        self._cohort_snapshot_last_error = ""
+        self._cohort_snapshot_refreshing = False
+        self._cohort_discovery_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="capacity-audit-cohort",
+        )
 
     def _use_remote_audit(self) -> bool:
         return self._audit_balancer is not None
@@ -369,6 +379,7 @@ class CapacityAuditMinerWorker:
                 )
                 return
         self._running = True
+        self._request_cohort_snapshot_refresh(block_number=0, force=True, reason="startup")
         self._thread = threading.Thread(target=self._run, name="capacity-audit-miner", daemon=True)
         self._thread.start()
         validator_urls = self._validator_endpoint_urls(force_refresh=True)
@@ -390,6 +401,10 @@ class CapacityAuditMinerWorker:
 
     def stop(self) -> None:
         self._running = False
+        executor = getattr(self, "_cohort_discovery_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._cohort_discovery_executor = None
 
     def _subtensor(self):
         SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
@@ -790,6 +805,11 @@ class CapacityAuditMinerWorker:
             current_epoch = int(block_number // epoch_blocks)
             self._refresh_subnet_runtime_config(current_epoch=current_epoch, force=True)
             epoch_blocks = self._epoch_blocks(subtensor)
+            self._request_cohort_snapshot_refresh(
+                block_number=block_number,
+                force=False,
+                reason="epoch",
+            )
         elif not getattr(self, "_subnet_runtime_config_authoritative", False):
             self._refresh_subnet_runtime_config(force=False)
         if not getattr(self, "_subnet_runtime_config_authoritative", False):
@@ -1027,6 +1047,200 @@ class CapacityAuditMinerWorker:
             if subtensor is not None:
                 self._close_subtensor(subtensor)
 
+    def _cohort_calibrated_active_slots(
+        self,
+        miners: list[ActiveMiner],
+    ) -> list[tuple[CapacitySlot, object]]:
+        slots: list[tuple[CapacitySlot, object]] = []
+        now = time.time()
+        for miner in miners:
+            registered_at = int(getattr(miner, "registered_at", 0) or 0)
+            min_age = float(self.runtime_cfg.min_registration_age_s or 0.0)
+            if registered_at > 0 and min_age > 0 and now - registered_at < min_age:
+                continue
+            gpu_row = match_gpu_class(
+                getattr(miner, "gpu_name", "") or "",
+                int(getattr(miner, "vram_gb", 0) or 0),
+                self.runtime_cfg,
+            )
+            if gpu_row is None or not gpu_row.calibrated or capacity_gpu_pass_count(gpu_row) <= 0:
+                continue
+            slots.append((
+                CapacitySlot(
+                    chain_id=int(getattr(self.config, "chain_id", 0) or 0),
+                    netuid=int(getattr(self.config, "netuid", 0) or 0),
+                    address=miner.address,
+                    model_index=int(miner.model_index),
+                    endpoint=miner.endpoint,
+                    model_id=miner.model_id,
+                    quant=miner.quant,
+                    max_context_len=int(miner.max_context_len or 0),
+                    gpu_name=getattr(miner, "gpu_name", "") or "",
+                    gpu_count=int(getattr(miner, "gpu_count", 0) or 0),
+                    vram_gb=int(getattr(miner, "vram_gb", 0) or 0),
+                    group_key=build_capacity_slot_group_key(
+                        address=miner.address,
+                        endpoint=miner.endpoint,
+                        model_id=miner.model_id,
+                        gpu_name=getattr(miner, "gpu_name", "") or "",
+                    ),
+                ),
+                gpu_row,
+            ))
+        return slots
+
+    def _discover_cohort_miners(self) -> list[ActiveMiner]:
+        try:
+            return discover_active_miners(self.miner_client, self.model_client)
+        except Exception as exc:
+            raise RuntimeError(f"cohort discovery failed: {exc}") from exc
+
+    def _refresh_cohort_snapshot_sync(self, block_number: int) -> None:
+        miners = self._discover_cohort_miners()
+        max_workers = min(32, max(1, len(miners)))
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        futures = [pool.submit(self._enrich_miner_hardware, miner) for miner in miners]
+        try:
+            try:
+                for future in as_completed(futures, timeout=20):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+            except FuturesTimeout:
+                stalled = sum(1 for future in futures if not future.done())
+                if stalled:
+                    bt.logging.warning(
+                        f"Capacity audit cohort hardware refresh timed out with "
+                        f"{stalled} pending endpoint(s)"
+                    )
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+        active = self._cohort_calibrated_active_slots(miners)
+        with self._cohort_snapshot_lock:
+            self._cohort_snapshot = active
+            self._cohort_snapshot_block = int(block_number or 0)
+            self._cohort_snapshot_last_error = ""
+        bt.logging.info(
+            f"Capacity audit cohort snapshot refreshed: slots={len(active)} "
+            f"block={int(block_number or 0)}"
+        )
+
+    def _request_cohort_snapshot_refresh(
+        self,
+        *,
+        block_number: int,
+        force: bool = False,
+        reason: str = "periodic",
+    ) -> None:
+        block = int(block_number or 0)
+        refresh_blocks = int(getattr(self.config, "capacity_audit_slot_refresh_blocks", 60) or 0)
+        if refresh_blocks <= 0 and not force:
+            return
+        with self._cohort_snapshot_lock:
+            if self._cohort_snapshot_refreshing:
+                return
+            last = int(self._cohort_snapshot_block or 0)
+            if not force and refresh_blocks > 0 and last > 0 and block - last < refresh_blocks:
+                return
+            self._cohort_snapshot_refreshing = True
+
+        def _run() -> None:
+            try:
+                self._refresh_cohort_snapshot_sync(block)
+            except Exception as exc:
+                with self._cohort_snapshot_lock:
+                    self._cohort_snapshot_last_error = str(exc)
+                bt.logging.warning(f"Capacity audit cohort snapshot refresh failed: {exc}")
+            finally:
+                with self._cohort_snapshot_lock:
+                    self._cohort_snapshot_refreshing = False
+
+        executor = getattr(self, "_cohort_discovery_executor", None)
+        if executor is None:
+            with self._cohort_snapshot_lock:
+                self._cohort_snapshot_refreshing = False
+            return
+        executor.submit(_run)
+
+    def _cohort_snapshot_for_selection(
+        self,
+        selection_block: int,
+    ) -> list[tuple[CapacitySlot, object]]:
+        block = int(selection_block)
+        stale_blocks = int(
+            getattr(self.config, "capacity_audit_slot_snapshot_stale_blocks", 120) or 0
+        )
+        with self._cohort_snapshot_lock:
+            active = list(self._cohort_snapshot)
+            snapshot_block = int(self._cohort_snapshot_block or 0)
+            refreshing = bool(self._cohort_snapshot_refreshing)
+            last_error = self._cohort_snapshot_last_error
+        if not active:
+            self._request_cohort_snapshot_refresh(
+                block_number=block,
+                force=False,
+                reason="empty",
+            )
+            suffix = f" error={last_error}" if last_error else ""
+            bt.logging.info(
+                f"Capacity audit: no cached cohort snapshot at block {block}; "
+                f"refreshing={refreshing}{suffix}"
+            )
+            return []
+        if stale_blocks > 0 and snapshot_block > 0 and block - snapshot_block > stale_blocks:
+            self._request_cohort_snapshot_refresh(
+                block_number=block,
+                force=False,
+                reason="stale",
+            )
+            bt.logging.info(
+                f"Capacity audit: cached cohort snapshot stale at block {block} "
+                f"(snapshot_block={snapshot_block}); skipping this window"
+            )
+            return []
+        return active
+
+    def _self_in_budgeted_cohort(
+        self,
+        supported_slot: CapacitySlot,
+        cohort_seed: str,
+        active_snapshot: list[tuple[CapacitySlot, object]],
+        selection_block: int,
+    ) -> bool:
+        active_slots = [slot for slot, _row in active_snapshot]
+        if self._has_active_local_audit() or int(selection_block) <= int(self._busy_selection_block_until or 0):
+            before = len(active_slots)
+            active_slots = [
+                slot for slot in active_slots
+                if not (
+                    slot.address_lower == supported_slot.address_lower
+                    and int(slot.model_index) == int(supported_slot.model_index)
+                )
+            ]
+            if before != len(active_slots):
+                bt.logging.info(
+                    f"Capacity audit: excluded local busy slot from cohort budget at "
+                    f"block {selection_block}"
+                )
+        budgeted, before_budget = apply_window_cohort_selection(
+            active_slots,
+            cohort_seed,
+            self.runtime_cfg,
+        )
+        if not budgeted:
+            return False
+        if before_budget > len(budgeted):
+            bt.logging.info(
+                f"Capacity audit: cohort budget truncated {before_budget}->{len(budgeted)} "
+                f"at block {selection_block}"
+            )
+        budgeted_ids = {slot_id(slot) for slot in budgeted}
+        return slot_id(supported_slot) in budgeted_ids
+
     def _derive_selected_self_slots(
         self,
         selection_block: int,
@@ -1082,6 +1296,24 @@ class CapacityAuditMinerWorker:
             )
             return []
         supported_slot, row = supported
+        active_snapshot = self._cohort_snapshot_for_selection(selection_block)
+        if not active_snapshot:
+            bt.logging.info(
+                "Capacity audit probabilistic slot hit but cohort snapshot unavailable: "
+                f"B_select={selection_block} audit_id={audit_id[:12]}"
+            )
+            return []
+        if not self._self_in_budgeted_cohort(
+            supported_slot,
+            seed,
+            active_snapshot,
+            selection_block,
+        ):
+            bt.logging.info(
+                "Capacity audit probabilistic slot hit but trimmed by cohort budget: "
+                f"B_select={selection_block} audit_id={audit_id[:12]}"
+            )
+            return []
         return [MinerAuditSlot(
             slot=supported_slot,
             gpu_class_name=row.match_gpu_name,
@@ -1211,25 +1443,41 @@ class CapacityAuditMinerWorker:
         miner.gpu_uuids = uuids if isinstance(uuids, list) else []
         return bool(miner.gpu_name and miner.vram_gb > 0)
 
+    def _enrich_miner_hardware(self, miner: ActiveMiner) -> None:
+        if (
+            self._use_remote_audit()
+            and miner.address.lower() == self.evm_address
+            and int(miner.model_index) == self.model_index
+            and self._apply_advertised_hardware_to_miner(miner)
+        ):
+            return
+        urls: list[str] = []
+        if (
+            miner.address.lower() == self.evm_address
+            and int(miner.model_index) == self.model_index
+        ):
+            urls = self._health_urls_for_miner(miner)
+        elif miner.endpoint:
+            urls = [miner.endpoint.rstrip("/")]
+        for base_url in urls:
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=5.0, verify=False)
+                if resp.status_code != 200:
+                    continue
+                hw = (resp.json() or {}).get("hardware") or {}
+                miner.gpu_name = hw.get("gpu_name") or ""
+                miner.gpu_count = int(hw.get("gpu_count") or 0)
+                miner.vram_gb = int(hw.get("vram_gb") or 0)
+                miner.compute_capability = hw.get("compute_capability") or ""
+                uuids = hw.get("gpu_uuids") or []
+                miner.gpu_uuids = uuids if isinstance(uuids, list) else []
+                break
+            except Exception:
+                continue
+
     def _enrich_hardware(self, miners: list[ActiveMiner]) -> None:
         for miner in miners:
-            if self._use_remote_audit() and self._apply_advertised_hardware_to_miner(miner):
-                continue
-            for base_url in self._health_urls_for_miner(miner):
-                try:
-                    resp = httpx.get(f"{base_url}/health", timeout=3.0)
-                    if resp.status_code != 200:
-                        continue
-                    hw = (resp.json() or {}).get("hardware") or {}
-                    miner.gpu_name = hw.get("gpu_name") or ""
-                    miner.gpu_count = int(hw.get("gpu_count") or 0)
-                    miner.vram_gb = int(hw.get("vram_gb") or 0)
-                    miner.compute_capability = hw.get("compute_capability") or ""
-                    uuids = hw.get("gpu_uuids") or []
-                    miner.gpu_uuids = uuids if isinstance(uuids, list) else []
-                    break
-                except Exception:
-                    continue
+            self._enrich_miner_hardware(miner)
 
     def _workspace_script(self) -> Path:
         return Path(__file__).resolve().parents[1] / "scripts" / "hot_capacity_workspace" / "bench_combined.py"
@@ -1668,7 +1916,19 @@ class CapacityAuditMinerWorker:
                     raise RuntimeError(status.error or "remote audit failed")
                 if not pass0_sent and status.pass0_root:
                     pass0_root = _root_hex(status.pass0_root)
-                    self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+                    accepted = self._publish_receipt(
+                        self._pass0_artifact(audit_slot, pass0_root)
+                    )
+                    if accepted <= 0:
+                        bt.logging.warning(
+                            f"Capacity audit pass0 publish rejected by all validators: "
+                            f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                        )
+                        raise RuntimeError("pass0 publish rejected by all validators")
+                    bt.logging.info(
+                        f"Capacity audit pass0 publish accepted: "
+                        f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                    )
                     pass0_sent = True
                 if not final_sent and status.final_timing:
                     final_timing_data = dict(status.final_timing)
@@ -1676,13 +1936,25 @@ class CapacityAuditMinerWorker:
                         raw_pass0_root = final_timing_data.get("pass0_root")
                         if raw_pass0_root:
                             pass0_root = _root_hex(raw_pass0_root)
-                            self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+                            accepted = self._publish_receipt(
+                                self._pass0_artifact(audit_slot, pass0_root)
+                            )
+                            if accepted <= 0:
+                                bt.logging.warning(
+                                    f"Capacity audit pass0 publish rejected by all validators: "
+                                    f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                                )
+                                raise RuntimeError("pass0 publish rejected by all validators")
+                            bt.logging.info(
+                                f"Capacity audit pass0 publish accepted: "
+                                f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                            )
                             pass0_sent = True
                     final_root = _root_hex(final_timing_data.get("root") or [])
                     transcript = str(final_timing_data.get("transcript_root") or "")
                     if not transcript:
                         transcript = transcript_root([pass0_root, final_root])
-                    self._publish_receipt(
+                    accepted = self._publish_receipt(
                         self._final_artifact(
                             audit_slot,
                             pass0_root,
@@ -1690,6 +1962,16 @@ class CapacityAuditMinerWorker:
                             transcript,
                             final_timing=final_timing_data,
                         )
+                    )
+                    if accepted <= 0:
+                        bt.logging.warning(
+                            f"Capacity audit final publish rejected by all validators: "
+                            f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                        )
+                        raise RuntimeError("final publish rejected by all validators")
+                    bt.logging.info(
+                        f"Capacity audit final publish accepted: "
+                        f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
                     )
                     final_sent = True
                     if subtensor is None:
@@ -1904,7 +2186,17 @@ class CapacityAuditMinerWorker:
             if not candidate:
                 return False
             pass0_root = candidate
-            self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+            accepted = self._publish_receipt(self._pass0_artifact(audit_slot, pass0_root))
+            if accepted <= 0:
+                bt.logging.warning(
+                    f"Capacity audit pass0 publish rejected by all validators: "
+                    f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                )
+                return False
+            bt.logging.info(
+                f"Capacity audit pass0 publish accepted: "
+                f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+            )
             pass0_sent = True
             return True
 
@@ -1932,7 +2224,7 @@ class CapacityAuditMinerWorker:
                 transcript = str(data.get("transcript_root") or "")
                 if not transcript:
                     transcript = transcript_root([pass0_root, final_root])
-                self._publish_receipt(
+                accepted = self._publish_receipt(
                     self._final_artifact(
                         audit_slot,
                         pass0_root,
@@ -1940,6 +2232,16 @@ class CapacityAuditMinerWorker:
                         transcript,
                         final_timing=final_timing_data,
                     )
+                )
+                if accepted <= 0:
+                    bt.logging.warning(
+                        f"Capacity audit final publish rejected by all validators: "
+                        f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
+                    )
+                    break
+                bt.logging.info(
+                    f"Capacity audit final publish accepted: "
+                    f"audit_id={audit_slot.audit_id[:12]} accepted={accepted}"
                 )
                 final_sent = True
                 if subtensor is None:
